@@ -287,12 +287,12 @@ fn home_plotter(
         let mut cx = status.current_x.lock().unwrap();
         let mut cy = status.current_y.lock().unwrap();
         
-        let dx = -*cx;
-        let dy = -*cy;
+        let steps_x = (-(*cx) * 80.0).round() as i32;
+        let steps_y = (-(*cy) * 80.0).round() as i32;
         
-        if dx.abs() > 0.001 || dy.abs() > 0.001 {
-            let steps_x = (dx * 80.0).round() as i32;
-            let steps_y = (dy * 80.0).round() as i32;
+        if steps_x != 0 || steps_y != 0 {
+            let dx = steps_x as f32 / 80.0;
+            let dy = steps_y as f32 / 80.0;
             let dist = (dx.powi(2) + dy.powi(2)).sqrt();
             let duration_ms = ((dist / speed) * 1000.0).round() as u64;
 
@@ -301,7 +301,7 @@ fn home_plotter(
             let start_x = *cx;
             let start_y = *cy;
             
-            driver.move_relative(dx, dy, speed)?;
+            driver.move_relative_steps(steps_x, steps_y, speed)?;
 
             // Wait and interpolate live coordinates (60 FPS)
             if duration_ms > 0 {
@@ -390,8 +390,8 @@ fn run_frame_preview(
         let state_clone = app_clone.state::<PlotterState>();
         let status_clone = app_clone.state::<PlotStatusState>();
         
-        let mut last_x = 0.0f32;
-        let mut last_y = 0.0f32;
+        let mut steps_x_acc = 0;
+        let mut steps_y_acc = 0;
         let total_points = points.len();
 
         // Ensure pen is UP
@@ -417,99 +417,106 @@ fn run_frame_preview(
                     break 'outer;
                 }
 
-                let total_dx = pt.x - last_x;
-                let total_dy = pt.y - last_y;
+                let target_steps_x = (pt.x * 80.0).round() as i32;
+                let target_steps_y = (pt.y * 80.0).round() as i32;
+                let total_dx_steps = target_steps_x - steps_x_acc;
+                let total_dy_steps = target_steps_y - steps_y_acc;
+
+                let total_dx = total_dx_steps as f32 / 80.0;
+                let total_dy = total_dy_steps as f32 / 80.0;
                 let total_dist = (total_dx.powi(2) + total_dy.powi(2)).sqrt();
 
                 if total_dist > 0.001 {
-                    let segment_size = 40.0f32; // 40mm segments for smooth motion (reduced EBB command overhead & chatter)
+                    let segment_size = 40.0f32; // 40mm segments
                     let num_segments = (total_dist / segment_size).ceil() as i32;
-                    let start_x = last_x;
-                    let start_y = last_y;
+                    let start_steps_x = steps_x_acc;
+                    let start_steps_y = steps_y_acc;
 
                     for seg in 1..=num_segments {
-                        let target_x = if seg == num_segments { pt.x } else { start_x + total_dx * (seg as f32 / num_segments as f32) };
-                        let target_y = if seg == num_segments { pt.y } else { start_y + total_dy * (seg as f32 / num_segments as f32) };
+                        let seg_target_steps_x = if seg == num_segments { target_steps_x } else { start_steps_x + ((total_dx_steps * seg) / num_segments) };
+                        let seg_target_steps_y = if seg == num_segments { target_steps_y } else { start_steps_y + ((total_dy_steps * seg) / num_segments) };
 
-                        let dx = target_x - last_x;
-                        let dy = target_y - last_y;
-                        let steps_x = (dx * 80.0).round() as i32;
-                        let steps_y = (dy * 80.0).round() as i32;
+                        let dx_steps = seg_target_steps_x - steps_x_acc;
+                        let dy_steps = seg_target_steps_y - steps_y_acc;
 
                         let mut move_duration_ms = 0;
                         let mut move_ok = false;
                         {
                             let mut driver_guard = state_clone.driver.lock().unwrap();
                             if let Some(ref mut driver) = *driver_guard {
-                                if driver.move_relative(dx, dy, speed).is_ok() {
+                                if driver.move_relative_steps(dx_steps, dy_steps, speed).is_ok() {
+                                    let dx = dx_steps as f32 / 80.0;
+                                    let dy = dy_steps as f32 / 80.0;
                                     let distance = (dx.powi(2) + dy.powi(2)).sqrt();
                                     move_duration_ms = ((distance / speed) * 1000.0).round() as u64;
-                                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Boundary Trace)", move_duration_ms, steps_x, steps_y));
+                                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Boundary Trace)", move_duration_ms, dx_steps, dy_steps));
                                     move_ok = true;
                                 }
                             }
                         }
 
                         if move_ok {
-                            last_x = target_x;
-                            last_y = target_y;
+                            let prev_x = steps_x_acc as f32 / 80.0;
+                            let prev_y = steps_y_acc as f32 / 80.0;
+                            steps_x_acc = seg_target_steps_x;
+                            steps_y_acc = seg_target_steps_y;
+                            let target_x = seg_target_steps_x as f32 / 80.0;
+                            let target_y = seg_target_steps_y as f32 / 80.0;
                             let _ = app_clone.emit("ebb-log", "Received: OK".to_string());
-                        }
 
-                        if move_duration_ms > 0 {
-                            let steps = move_duration_ms / 16;
-                            let start_seg_x = last_x - dx;
-                            let start_seg_y = last_y - dy;
-                            for step in 0..steps {
-                                std::thread::sleep(std::time::Duration::from_millis(16));
-                                let t = (step as f32 + 1.0) / (steps as f32);
-                                let interp_x = start_seg_x + dx * t;
-                                let interp_y = start_seg_y + dy * t;
+                            if move_duration_ms > 0 {
+                                let steps = move_duration_ms / 16;
+                                for step in 0..steps {
+                                    std::thread::sleep(std::time::Duration::from_millis(16));
+                                    let t = (step as f32 + 1.0) / (steps as f32);
+                                    let interp_x = prev_x + (target_x - prev_x) * t;
+                                    let interp_y = prev_y + (target_y - prev_y) * t;
 
-                                {
-                                    let mut cx = status_clone.current_x.lock().unwrap();
-                                    let mut cy = status_clone.current_y.lock().unwrap();
-                                    *cx = interp_x;
-                                    *cy = interp_y;
+                                    {
+                                        let mut cx = status_clone.current_x.lock().unwrap();
+                                        let mut cy = status_clone.current_y.lock().unwrap();
+                                        *cx = interp_x;
+                                        *cy = interp_y;
+                                    }
+
+                                    let _ = app_clone.emit(
+                                        "plot-progress",
+                                        ProgressPayload {
+                                            path_index: 0,
+                                            point_index: pt_idx,
+                                            global_point_index: pt_idx + 1,
+                                            total_points,
+                                            x: interp_x,
+                                            y: interp_y,
+                                            loop_index: loop_count,
+                                            total_loops: 10,
+                                        },
+                                    );
                                 }
-
-                                let _ = app_clone.emit(
-                                    "plot-progress",
-                                    ProgressPayload {
-                                        path_index: 0,
-                                        point_index: pt_idx,
-                                        global_point_index: pt_idx + 1,
-                                        total_points,
-                                        x: interp_x,
-                                        y: interp_y,
-                                        loop_index: loop_count,
-                                        total_loops: 10,
-                                    },
-                                );
+                                std::thread::sleep(std::time::Duration::from_millis(move_duration_ms % 16));
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(move_duration_ms % 16));
-                        }
 
-                        // Finally, set coordinates to target exactly and emit progress
-                        {
-                            let mut cx = status_clone.current_x.lock().unwrap();
-                            let mut cy = status_clone.current_y.lock().unwrap();
-                            *cx = target_x;
-                            *cy = target_y;
+                            // Finally, set coordinates to target exactly and emit progress
+                            {
+                                let mut cx = status_clone.current_x.lock().unwrap();
+                                let mut cy = status_clone.current_y.lock().unwrap();
+                                *cx = target_x;
+                                *cy = target_y;
+                            }
+                            let _ = app_clone.emit(
+                                "plot-progress",
+                                ProgressPayload {
+                                    path_index: 0,
+                                    point_index: pt_idx,
+                                    global_point_index: pt_idx + 1,
+                                    total_points,
+                                    x: target_x,
+                                    y: target_y,
+                                    loop_index: loop_count,
+                                    total_loops: 10,
+                                },
+                            );
                         }
-                        let _ = app_clone.emit(
-                            "plot-progress",
-                            ProgressPayload {
-                                path_index: 0,
-                                point_index: pt_idx,
-                                global_point_index: pt_idx + 1,
-                                total_points,
-                                x: target_x,
-                                y: target_y,
-                                loop_index: loop_count,
-                                total_loops: 10,
-                            },
-                        );
                     }
                 }
             }
@@ -522,17 +529,22 @@ fn run_frame_preview(
             {
                 let mut driver_guard = state_clone.driver.lock().unwrap();
                 if let Some(ref mut driver) = *driver_guard {
-                    if driver.move_relative(-last_x, -last_y, speed).is_ok() {
-                        let dist = (last_x.powi(2) + last_y.powi(2)).sqrt();
+                    let dx_steps = -steps_x_acc;
+                    let dy_steps = -steps_y_acc;
+                    if driver.move_relative_steps(dx_steps, dy_steps, speed).is_ok() {
+                        let dx = dx_steps as f32 / 80.0;
+                        let dy = dy_steps as f32 / 80.0;
+                        let dist = (dx.powi(2) + dy.powi(2)).sqrt();
                         duration_ms = ((dist / speed) * 1000.0).round() as u64;
+                        let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Homing carriage back to home)", duration_ms, dx_steps, dy_steps));
                     }
                 }
             }
 
             if duration_ms > 0 {
                 let steps = duration_ms / 16;
-                let start_x = last_x;
-                let start_y = last_y;
+                let start_x = steps_x_acc as f32 / 80.0;
+                let start_y = steps_y_acc as f32 / 80.0;
                 for step in 0..steps {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                     let t = (step as f32 + 1.0) / (steps as f32);
@@ -571,9 +583,13 @@ fn run_frame_preview(
                 *cy = 0.0;
             }
         } else {
-            // Aborted! Stop motion immediately and return home safely
+            // Aborted! Stop motion immediately, raise pen, and return home safely
             let mut driver_guard = state_clone.driver.lock().unwrap();
             if let Some(ref mut driver) = *driver_guard {
+                // Raise pen immediately on abort!
+                let _ = driver.toggle_pen(false, 300);
+                let _ = app_clone.emit("ebb-log", "Sent: SP,0,300 (Raise Pen on abort)".to_string());
+
                 let _ = driver.clear_motion();
                 let _ = app_clone.emit("ebb-log", "Sent: CM (Clear EBB buffer)".to_string());
                 
@@ -581,16 +597,16 @@ fn run_frame_preview(
                 let _ = driver.enable_motors(true);
                 let _ = app_clone.emit("ebb-log", "Sent: EM,1,1 (Re-enable motors for homing)".to_string());
 
-                let dx = -last_x;
-                let dy = -last_y;
-                if dx.abs() > 0.001 || dy.abs() > 0.001 {
-                    let steps_x = (dx * 80.0).round() as i32;
-                    let steps_y = (dy * 80.0).round() as i32;
+                let dx_steps = -steps_x_acc;
+                let dy_steps = -steps_y_acc;
+                if dx_steps != 0 || dy_steps != 0 {
+                    let dx = dx_steps as f32 / 80.0;
+                    let dy = dy_steps as f32 / 80.0;
                     let dist = (dx.powi(2) + dy.powi(2)).sqrt();
-                    let duration_ms = ((dist / speed) * 1000.0).round() as u32;
+                    let duration_ms = ((dist / 50.0) * 1000.0).round() as u32;
 
-                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Homing carriage back to home)", duration_ms, steps_x, steps_y));
-                    let _ = driver.move_relative(dx, dy, speed);
+                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Homing carriage back to home)", duration_ms, dx_steps, dy_steps));
+                    let _ = driver.move_relative_steps(dx_steps, dy_steps, 50.0);
                     
                     if duration_ms > 0 {
                         let steps = duration_ms / 16;
@@ -687,8 +703,8 @@ fn start_plot(
     std::thread::spawn(move || {
         let state_clone = app_clone.state::<PlotterState>();
         let status_clone = app_clone.state::<PlotStatusState>();
-        let mut last_x = 0.0f32;
-        let mut last_y = 0.0f32;
+        let mut steps_x_acc = 0;
+        let mut steps_y_acc = 0;
         let mut global_point_counter = 0;
 
         // Ensure pen is up to start
@@ -712,25 +728,30 @@ fn start_plot(
 
             // Move to start of path (pen up)
             let start_pt = &path.points[0];
-            let dx = start_pt.x - last_x;
-            let dy = start_pt.y - last_y;
+            let target_steps_x = (start_pt.x * 80.0).round() as i32;
+            let target_steps_y = (start_pt.y * 80.0).round() as i32;
+            let dx_steps = target_steps_x - steps_x_acc;
+            let dy_steps = target_steps_y - steps_y_acc;
+
+            let dx = dx_steps as f32 / 80.0;
+            let dy = dy_steps as f32 / 80.0;
             let travel_dist = (dx.powi(2) + dy.powi(2)).sqrt();
             let travel_duration_ms = ((travel_dist / air_speed) * 1000.0).round() as u64;
-            let steps_x = (dx * 80.0).round() as i32;
-            let steps_y = (dy * 80.0).round() as i32;
 
             {
                 let mut driver_guard = state_clone.driver.lock().unwrap();
                 if let Some(ref mut driver) = *driver_guard {
-                    let _ = driver.move_relative(dx, dy, air_speed);
+                    let _ = driver.move_relative_steps(dx_steps, dy_steps, air_speed);
                 }
             }
-            let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Travel to path start)", travel_duration_ms, steps_x, steps_y));
+            let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Travel to path start)", travel_duration_ms, dx_steps, dy_steps));
             
-            let prev_x = last_x;
-            let prev_y = last_y;
-            last_x = start_pt.x;
-            last_y = start_pt.y;
+            let prev_x = steps_x_acc as f32 / 80.0;
+            let prev_y = steps_y_acc as f32 / 80.0;
+            steps_x_acc = target_steps_x;
+            steps_y_acc = target_steps_y;
+            let target_x = target_steps_x as f32 / 80.0;
+            let target_y = target_steps_y as f32 / 80.0;
 
             // Set coordinates to start of travel move to prevent ghosting
             {
@@ -751,8 +772,8 @@ fn start_plot(
                     
                     // Interpolate coordinates
                     let t = (step as f32 + 1.0) / (steps as f32);
-                    let interp_x = prev_x + (start_pt.x - prev_x) * t;
-                    let interp_y = prev_y + (start_pt.y - prev_y) * t;
+                    let interp_x = prev_x + (target_x - prev_x) * t;
+                    let interp_y = prev_y + (target_y - prev_y) * t;
 
                     {
                         let mut cx = status_clone.current_x.lock().unwrap();
@@ -783,8 +804,8 @@ fn start_plot(
             {
                 let mut cx = status_clone.current_x.lock().unwrap();
                 let mut cy = status_clone.current_y.lock().unwrap();
-                *cx = start_pt.x;
-                *cy = start_pt.y;
+                *cx = target_x;
+                *cy = target_y;
             }
             let _ = app_clone.emit("ebb-log", "Received: OK".to_string());
 
@@ -815,25 +836,30 @@ fn start_plot(
 
                 // Skip first point since we are already there
                 if pt_idx > 0 {
-                    let dx = pt.x - last_x;
-                    let dy = pt.y - last_y;
+                    let target_steps_x = (pt.x * 80.0).round() as i32;
+                    let target_steps_y = (pt.y * 80.0).round() as i32;
+                    let dx_steps = target_steps_x - steps_x_acc;
+                    let dy_steps = target_steps_y - steps_y_acc;
+
+                    let dx = dx_steps as f32 / 80.0;
+                    let dy = dy_steps as f32 / 80.0;
                     let draw_dist = (dx.powi(2) + dy.powi(2)).sqrt();
                     let draw_duration_ms = ((draw_dist / speed) * 1000.0).round() as u64;
-                    let steps_x = (dx * 80.0).round() as i32;
-                    let steps_y = (dy * 80.0).round() as i32;
 
                     {
                         let mut driver_guard = state_clone.driver.lock().unwrap();
                         if let Some(ref mut driver) = *driver_guard {
-                            let _ = driver.move_relative(dx, dy, speed);
+                            let _ = driver.move_relative_steps(dx_steps, dy_steps, speed);
                         }
                     }
-                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Drawing stroke)", draw_duration_ms, steps_x, steps_y));
+                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Drawing stroke)", draw_duration_ms, dx_steps, dy_steps));
 
-                    let prev_x = last_x;
-                    let prev_y = last_y;
-                    last_x = pt.x;
-                    last_y = pt.y;
+                    let prev_x = steps_x_acc as f32 / 80.0;
+                    let prev_y = steps_y_acc as f32 / 80.0;
+                    steps_x_acc = target_steps_x;
+                    steps_y_acc = target_steps_y;
+                    let target_x = target_steps_x as f32 / 80.0;
+                    let target_y = target_steps_y as f32 / 80.0;
 
                     // Set coordinates to start of drawing move to prevent ghosting
                     {
@@ -854,12 +880,12 @@ fn start_plot(
                             
                             // Interpolate coordinates
                             let t = (step as f32 + 1.0) / (steps as f32);
-                            let interp_x = prev_x + (pt.x - prev_x) * t;
-                            let interp_y = prev_y + (pt.y - prev_y) * t;
+                            let interp_x = prev_x + (target_x - prev_x) * t;
+                            let interp_y = prev_y + (target_y - prev_y) * t;
 
                             {
                                 let mut cx = status_clone.current_x.lock().unwrap();
-                                  let mut cy = status_clone.current_y.lock().unwrap();
+                                let mut cy = status_clone.current_y.lock().unwrap();
                                 *cx = interp_x;
                                 *cy = interp_y;
                             }
@@ -886,8 +912,8 @@ fn start_plot(
                     {
                         let mut cx = status_clone.current_x.lock().unwrap();
                         let mut cy = status_clone.current_y.lock().unwrap();
-                        *cx = pt.x;
-                        *cy = pt.y;
+                        *cx = target_x;
+                        *cy = target_y;
                     }
                     let _ = app_clone.emit("ebb-log", "Received: OK".to_string());
                 }
@@ -933,22 +959,22 @@ fn start_plot(
             {
                 let mut driver_guard = state_clone.driver.lock().unwrap();
                 if let Some(ref mut driver) = *driver_guard {
-                    let dx = -last_x;
-                    let dy = -last_y;
-                    let steps_x = (dx * 80.0).round() as i32;
-                    let steps_y = (dy * 80.0).round() as i32;
-                    if driver.move_relative(dx, dy, 50.0).is_ok() {
+                    let dx_steps = -steps_x_acc;
+                    let dy_steps = -steps_y_acc;
+                    if driver.move_relative_steps(dx_steps, dy_steps, 50.0).is_ok() {
+                        let dx = dx_steps as f32 / 80.0;
+                        let dy = dy_steps as f32 / 80.0;
                         let dist = (dx.powi(2) + dy.powi(2)).sqrt();
                         duration_ms = ((dist / 50.0) * 1000.0).round() as u64;
-                        let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Return Home)", duration_ms, steps_x, steps_y));
+                        let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Return Home)", duration_ms, dx_steps, dy_steps));
                     }
                 }
             }
 
             if duration_ms > 0 {
                 let steps = duration_ms / 16;
-                let start_x = last_x;
-                let start_y = last_y;
+                let start_x = steps_x_acc as f32 / 80.0;
+                let start_y = steps_y_acc as f32 / 80.0;
                 for step in 0..steps {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                     let t = (step as f32 + 1.0) / (steps as f32);
@@ -996,9 +1022,14 @@ fn start_plot(
                 *cy = 0.0;
             }
         } else {
-            // Aborted! Stop motion immediately and return home safely
+            // Aborted! Stop motion immediately, raise pen, and return home safely
             let mut driver_guard = state_clone.driver.lock().unwrap();
             if let Some(ref mut driver) = *driver_guard {
+                // Raise pen immediately on abort!
+                let _ = driver.toggle_pen(false, pen_up_duration);
+                let _ = app_clone.emit("ebb-log", format!("Sent: SP,0,{} (Raise Pen on abort)", pen_up_duration));
+                let _ = app_clone.emit("ebb-log", "Received: OK".to_string());
+
                 let _ = driver.clear_motion();
                 let _ = app_clone.emit("ebb-log", "Sent: CM (Clear EBB buffer)".to_string());
                 
@@ -1006,16 +1037,16 @@ fn start_plot(
                 let _ = driver.enable_motors(true);
                 let _ = app_clone.emit("ebb-log", "Sent: EM,1,1 (Re-enable motors for homing)".to_string());
 
-                let dx = -last_x;
-                let dy = -last_y;
-                if dx.abs() > 0.001 || dy.abs() > 0.001 {
-                    let steps_x = (dx * 80.0).round() as i32;
-                    let steps_y = (dy * 80.0).round() as i32;
+                let dx_steps = -steps_x_acc;
+                let dy_steps = -steps_y_acc;
+                if dx_steps != 0 || dy_steps != 0 {
+                    let dx = dx_steps as f32 / 80.0;
+                    let dy = dy_steps as f32 / 80.0;
                     let dist = (dx.powi(2) + dy.powi(2)).sqrt();
                     let duration_ms = ((dist / 50.0) * 1000.0).round() as u32; // return home at 50mm/s
 
-                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Homing carriage back to home)", duration_ms, steps_x, steps_y));
-                    let _ = driver.move_relative(dx, dy, 50.0);
+                    let _ = app_clone.emit("ebb-log", format!("Sent: XM,{},{},{} (Homing carriage back to home)", duration_ms, dx_steps, dy_steps));
+                    let _ = driver.move_relative_steps(dx_steps, dy_steps, 50.0);
                     
                     if duration_ms > 0 {
                         let steps = duration_ms / 16;
@@ -1055,7 +1086,7 @@ fn start_plot(
                 let _ = driver.enable_motors(false); // release motors
                 let _ = app_clone.emit("ebb-log", "Sent: EM,0,0 (Release motors at home)".to_string());
             }
-
+            
             // Reset tracked position to home (0,0)
             {
                 let mut cx = status_clone.current_x.lock().unwrap();

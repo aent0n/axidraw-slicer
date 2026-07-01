@@ -18,10 +18,12 @@
 
 ### 1. Prepare tab
 *   **Vector & image import:** Drag-and-drop vector SVG files or standard raster images.
-*   **Vectorization:** Convert any image into clean vector paths using three built-in algorithms:
+*   **Vectorization:** Convert any image into clean vector paths using five built-in algorithms:
     *   *Sketch (Squiggle)*: Continuous wave-like patterns for artistic shading.
     *   *Hatch (Waves)*: Density-modulated wave grids.
     *   *TSP (Traveling Salesperson)*: Generates a single continuous path connecting all points optimally.
+    *   *Outline (Line Art)*: Sobel contour outlines for clean line art representation.
+    *   *Cross-Hatching (Waves)*: Double-direction density-modulated wave grids for cross-hatch shading.
 *   **Workspace manipulation:** Translate, scale, and rotate objects directly on the page grid using interactive mouse handles or numerical input fields.
 *   **Auto-arrange:** Automatically arrange multiple designs on the bed compactly, optimizing space and maintaining comfortable margins.
 *   **Pen tracker:** Track accumulated drawing distance in meters for standard and custom pen profiles, with depletion warnings when the ink capacity is reached.

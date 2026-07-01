@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseSVG } from "./utils/svgParser";
@@ -99,6 +99,7 @@ function App() {
   const [progress, setProgress] = useState<ProgressPayload | null>(null);
 
   // File Loading
+  const [tracingBoundary, setTracingBoundary] = useState<{ minX: number, maxX: number, minY: number, maxY: number } | null>(null);
   const [fileType, setFileType] = useState<"none" | "image" | "svg">("none");
   const [fileName, setFileName] = useState("");
   const [imageBytes, setImageBytes] = useState<Uint8Array | null>(null);
@@ -141,13 +142,21 @@ function App() {
   const [slicedPaths, setSlicedPaths] = useState<Toolpath[]>([]); // NN-optimized paths
 
   // Pen Profiles Manager
-  const [penProfiles, setPenProfiles] = useState<PenProfile[]>([
-    { id: "generic", name: "Generic standard pen", capacityMeters: 2000, accumulatedDistanceMeters: 0 },
-    { id: "pilot-g2", name: "Pilot G2 gel pen", capacityMeters: 1500, accumulatedDistanceMeters: 0 },
-    { id: "micron", name: "Sakura Micron fine-liner", capacityMeters: 800, accumulatedDistanceMeters: 0 },
-    { id: "bic", name: "Bic Cristal ballpoint", capacityMeters: 2500, accumulatedDistanceMeters: 0 },
-  ]);
-  const [activeProfileId, setActiveProfileId] = useState("generic"); // default is generic
+  const [penProfiles, setPenProfiles] = useState<PenProfile[]>(() => {
+    try {
+      const saved = localStorage.getItem("axidraw_pen_profiles");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      console.error("Error loading pen profiles:", e);
+    }
+    return [];
+  });
+  const [activeProfileId, setActiveProfileId] = useState<string>(() => {
+    return localStorage.getItem("axidraw_active_profile_id") || "";
+  });
   
   // Custom Profile Add
   const [newPenName, setNewPenName] = useState("");
@@ -212,8 +221,34 @@ function App() {
   const consoleEndRef = useRef<HTMLDivElement | null>(null);
   const monitorCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const consoleCardRef = useRef<HTMLDivElement | null>(null);
+  
   const monitorCanvasContainerRef = useRef<HTMLDivElement | null>(null);
+  const monitorCanvasContainerCallback = useCallback((node: HTMLDivElement | null) => {
+    monitorCanvasContainerRef.current = node;
+    if (node) {
+      const handleWheel = (e: WheelEvent) => {
+        if (!e.ctrlKey) return; // Only zoom if Ctrl key is held!
+        e.preventDefault();
+        const zoomFactor = e.deltaY < 0 ? 0.25 : -0.25;
+        setMonitorZoom(prev => Math.max(1.0, Math.min(5.0, prev + zoomFactor)));
+      };
+      node.addEventListener("wheel", handleWheel, { passive: false });
+    }
+  }, []);
+
   const prepareScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const prepareScrollContainerCallback = useCallback((node: HTMLDivElement | null) => {
+    prepareScrollContainerRef.current = node;
+    if (node) {
+      const handleWheel = (e: WheelEvent) => {
+        if (!e.ctrlKey) return; // Only zoom if Ctrl key is held!
+        e.preventDefault();
+        const zoomFactor = e.deltaY < 0 ? 0.15 : -0.15;
+        setZoom(prev => Math.max(1.0, Math.min(5.0, prev + zoomFactor)));
+      };
+      node.addEventListener("wheel", handleWheel, { passive: false });
+    }
+  }, []);
 
   // Refs to avoid stale closures in event listeners
   const slicingStatsRef = useRef(slicingStats);
@@ -228,6 +263,9 @@ function App() {
   const slicedPathsRef = useRef(slicedPaths);
   useEffect(() => { slicedPathsRef.current = slicedPaths; }, [slicedPaths]);
 
+  const isPlottingRef = useRef(isPlotting);
+  useEffect(() => { isPlottingRef.current = isPlotting; }, [isPlotting]);
+
   // Click-and-drag panning states
   const [isPanningPrepare, setIsPanningPrepare] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
@@ -237,7 +275,43 @@ function App() {
   // Slicer Clipboard
   const [clipboard, setClipboard] = useState<SlicerObject | null>(null);
   const [allowArrangeResize, setAllowArrangeResize] = useState<boolean>(false);
-  const [jobHistory, setJobHistory] = useState<PastJob[]>([]);
+  const [jobHistory, setJobHistory] = useState<PastJob[]>(() => {
+    try {
+      const saved = localStorage.getItem("axidraw_job_history");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      console.error("Error loading job history:", e);
+    }
+    return [];
+  });
+
+  // LocalStorage Persistence Hooks
+  useEffect(() => {
+    localStorage.setItem("axidraw_pen_profiles", JSON.stringify(penProfiles));
+  }, [penProfiles]);
+
+  useEffect(() => {
+    localStorage.setItem("axidraw_active_profile_id", activeProfileId);
+  }, [activeProfileId]);
+
+  useEffect(() => {
+    localStorage.setItem("axidraw_job_history", JSON.stringify(jobHistory));
+  }, [jobHistory]);
+
+  const scaleWidthRef = useRef(scaleWidth);
+  useEffect(() => { scaleWidthRef.current = scaleWidth; }, [scaleWidth]);
+
+  const scaleHeightRef = useRef(scaleHeight);
+  useEffect(() => { scaleHeightRef.current = scaleHeight; }, [scaleHeight]);
+
+  const activeProfileIdRef = useRef(activeProfileId);
+  useEffect(() => { activeProfileIdRef.current = activeProfileId; }, [activeProfileId]);
+
+  const addToJobHistoryRef = useRef<((aborted: boolean) => void) | null>(null);
+  useEffect(() => { addToJobHistoryRef.current = addToJobHistory; }, [addToJobHistory]);
 
   const getRawObjectBounds = (obj: SlicerObject) => {
     if (obj.rawPaths.length === 0) return null;
@@ -300,6 +374,58 @@ function App() {
     };
   };
 
+  // Ramer-Douglas-Peucker (RDP) path simplification helpers to prevent EBB stepper motors from slipping due to chatter at high speed
+  const getSqSegDist = (p: Point, p1: Point, p2: Point) => {
+    let x = p1.x;
+    let y = p1.y;
+    let dx = p2.x - x;
+    let dy = p2.y - y;
+
+    if (dx !== 0 || dy !== 0) {
+      const t = ((p.x - x) * dx + (p.y - y) * dy) / (dx * dx + dy * dy);
+      if (t > 1) {
+        x = p2.x;
+        y = p2.y;
+      } else if (t > 0) {
+        x += dx * t;
+        y += dy * t;
+      }
+    }
+
+    dx = p.x - x;
+    dy = p.y - y;
+
+    return dx * dx + dy * dy;
+  };
+
+  const simplifyDPStep = (points: Point[], first: number, last: number, sqTolerance: number, simplified: Point[]) => {
+    let maxSqDist = sqTolerance;
+    let index = -1;
+
+    for (let i = first + 1; i < last; i++) {
+      const sqDist = getSqSegDist(points[i], points[first], points[last]);
+      if (sqDist > maxSqDist) {
+        index = i;
+        maxSqDist = sqDist;
+      }
+    }
+
+    if (index > -1) {
+      if (index - first > 1) simplifyDPStep(points, first, index, sqTolerance, simplified);
+      simplified.push(points[index]);
+      if (last - index > 1) simplifyDPStep(points, index, last, sqTolerance, simplified);
+    }
+  };
+
+  const simplifyRDP = (points: Point[], tolerance: number) => {
+    if (points.length <= 2) return points;
+    const sqTolerance = tolerance * tolerance;
+    const simplified: Point[] = [points[0]];
+    simplifyDPStep(points, 0, points.length - 1, sqTolerance, simplified);
+    simplified.push(points[points.length - 1]);
+    return simplified;
+  };
+
   const getProcessedToolpaths = (): Toolpath[] => {
     const allPaths: Toolpath[] = [];
 
@@ -353,7 +479,10 @@ function App() {
 
           return { x: finalX, y: finalY };
         });
-        return { points };
+
+        // Apply Ramer-Douglas-Peucker simplification with 0.04mm tolerance (invisible, but huge EBB speed stability gain)
+        const simplifiedPoints = simplifyRDP(points, 0.04);
+        return { points: simplifiedPoints };
       });
 
       allPaths.push(...processedObjPaths);
@@ -500,6 +629,64 @@ function App() {
     }
   };
 
+  const handleOptimizeVectorizerScale = async () => {
+    if (!imageBytes) {
+      setStatusMsg("No loaded image bytes found to optimize");
+      return;
+    }
+    const selected = objects.find(o => o.id === selectedObjectId);
+    if (!selected) return;
+
+    setIsGenerating(true);
+    setStatusMsg("Optimizing vector density to current scale...");
+    try {
+      const scaleFactor = selected.scale / 100;
+      // Calculate target physical size based on the current scale percentage
+      const targetW = scaleWidth * scaleFactor;
+      const targetH = scaleHeight * scaleFactor;
+
+      // Scale down density parameters proportionally to the scale factor to simplify the design
+      // instead of keeping it extremely dense/condensed at smaller sizes!
+      const optMaxLines = Math.max(100, Math.round(maxLines * scaleFactor));
+      const optLineDensity = Math.max(0.5, lineDensity * scaleFactor);
+
+      const settings = {
+        algorithm,
+        max_lines: optMaxLines,
+        line_density: optLineDensity,
+        resolution,
+        scale_width: targetW,
+        scale_height: targetH,
+      };
+
+      const result: Toolpath[] = await invoke("run_vectorization", {
+        imageBytes: Array.from(imageBytes),
+        settings,
+      });
+
+      // Update the object with the new paths, reset scale back to 100 (since the paths are pre-scaled physically)
+      // and preserve offset and name!
+      setObjects(prev => prev.map(o => {
+        if (o.id === selected.id) {
+          return {
+            ...o,
+            rawPaths: result,
+            scale: 100 // Reset scale to 100% since its physical paths are now exactly sized!
+          };
+        }
+        return o;
+      }));
+
+      setSlicingStats(null);
+      setSlicedPaths([]);
+      setStatusMsg("Vector density optimized successfully for current scale!");
+    } catch (err: any) {
+      setStatusMsg(`Optimization failed: ${err}`);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
   const handleAddPenProfile = () => {
     if (!newPenName.trim()) return;
     const newId = `custom-${Date.now()}`;
@@ -529,6 +716,48 @@ function App() {
     }));
     setSlicingStats(null); // Force re-slice
     setSlicedPaths([]);
+  };
+
+  const getUnrotatedObjectBounds = (obj: SlicerObject) => {
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    obj.rawPaths.forEach(path => {
+      path.points.forEach(pt => {
+        if (pt.x < minX) minX = pt.x;
+        if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y;
+        if (pt.y > maxY) maxY = pt.y;
+      });
+    });
+    if (minX === Infinity || minY === Infinity) return null;
+    return { minX, maxX, minY, maxY };
+  };
+
+  const flipObject = (direction: "horizontal" | "vertical") => {
+    if (activeTab === "preview") return;
+    if (selectedObjectIds.length === 0) return;
+    setObjects(prev => prev.map(obj => {
+      if (selectedObjectIds.includes(obj.id)) {
+        const bounds = getUnrotatedObjectBounds(obj);
+        if (!bounds) return obj;
+        const midX = (bounds.minX + bounds.maxX) / 2;
+        const midY = (bounds.minY + bounds.maxY) / 2;
+        const flippedPaths = obj.rawPaths.map(path => ({
+          points: path.points.map(pt => ({
+            x: direction === "horizontal" ? (2 * midX - pt.x) : pt.x,
+            y: direction === "vertical" ? (2 * midY - pt.y) : pt.y
+          }))
+        }));
+        return {
+          ...obj,
+          rawPaths: flippedPaths
+        };
+      }
+      return obj;
+    }));
+    setSlicingStats(null); // Force re-slice
+    setSlicedPaths([]);
+    setStatusMsg(`Flipped selection ${direction === "horizontal" ? "horizontally" : "vertically"}`);
   };
 
   const handleArrangeAll = () => {
@@ -861,41 +1090,7 @@ function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [objects, selectedObjectIds, clipboard, activeTab]);
 
-  // Scroll wheel zoom on bed wrapper
-  useEffect(() => {
-    const wrapper = canvasWrapperRef.current;
-    if (!wrapper) return;
-    
-    const handleWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey) return; // Only zoom if Ctrl key is held!
-      e.preventDefault();
-      const zoomFactor = e.deltaY < 0 ? 0.15 : -0.15;
-      setZoom(prev => Math.max(1.0, Math.min(5.0, prev + zoomFactor)));
-    };
-    
-    wrapper.addEventListener("wheel", handleWheel, { passive: false });
-    return () => {
-      wrapper.removeEventListener("wheel", handleWheel);
-    };
-  }, []);
 
-  // Scroll wheel zoom on live visualizer preview wrapper
-  useEffect(() => {
-    const container = monitorCanvasContainerRef.current;
-    if (!container) return;
-    
-    const handleWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey) return; // Only zoom if Ctrl key is held!
-      e.preventDefault();
-      const zoomFactor = e.deltaY < 0 ? 0.25 : -0.25;
-      setMonitorZoom(prev => Math.max(1.0, Math.min(5.0, prev + zoomFactor)));
-    };
-    
-    container.addEventListener("wheel", handleWheel, { passive: false });
-    return () => {
-      container.removeEventListener("wheel", handleWheel);
-    };
-  }, [activeTab]);
 
   // Autoscroll monitor console
   useEffect(() => {
@@ -986,45 +1181,51 @@ function App() {
 
   // Listen to Tauri events for plotting progress, console logging, and Inkscape imports
   useEffect(() => {
+    let active = true;
     let unlistenProgress: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
     let unlistenInkscape: (() => void) | null = null;
     let unlistenLog: (() => void) | null = null;
 
     listen<ProgressPayload>("plot-progress", (event) => {
-      setProgress(event.payload);
       setCurrentPos({ x: event.payload.x, y: event.payload.y });
 
-      const payload = event.payload;
-      const elapsed = jobStartTimeRef.current ? Math.round((Date.now() - jobStartTimeRef.current) / 1000) : 0;
-      const totalPoints = payload.total_points > 0 ? payload.total_points : 1;
-      const ratio = payload.global_point_index / totalPoints;
-      
-      const drawM = slicingStatsRef.current ? (slicingStatsRef.current.drawDist * ratio) / 1000.0 : 0.0;
-      const travelM = slicingStatsRef.current ? (slicingStatsRef.current.airDist * ratio) / 1000.0 : 0.0;
-      const remaining = slicingStatsRef.current ? Math.max(0, Math.round(slicingStatsRef.current.timeEst - elapsed)) : 0;
-      const airTravelSecs = slicingStatsRef.current ? slicingStatsRef.current.airTimeEst * ratio : 0.0;
+      if (isPlottingRef.current) {
+        setProgress(event.payload);
 
-      setJobStats({
-        status: isPausedRef.current ? "paused" : "printing",
-        pointsCompleted: payload.global_point_index,
-        totalPoints: payload.total_points,
-        pathsCompleted: payload.path_index,
-        totalPaths: slicedPathsRef.current.length,
-        distanceDrawn: parseFloat(drawM.toFixed(2)),
-        distanceTraveled: parseFloat(travelM.toFixed(2)),
-        elapsedTime: elapsed,
-        estimatedRemaining: remaining,
-        airTravelTime: Math.round(airTravelSecs)
-      });
+        const payload = event.payload;
+        const elapsed = jobStartTimeRef.current ? Math.round((Date.now() - jobStartTimeRef.current) / 1000) : 0;
+        const totalPoints = payload.total_points > 0 ? payload.total_points : 1;
+        const ratio = payload.global_point_index / totalPoints;
+        
+        const drawM = slicingStatsRef.current ? (slicingStatsRef.current.drawDist * ratio) / 1000.0 : 0.0;
+        const travelM = slicingStatsRef.current ? (slicingStatsRef.current.airDist * ratio) / 1000.0 : 0.0;
+        const remaining = slicingStatsRef.current ? Math.max(0, Math.round(slicingStatsRef.current.timeEst - elapsed)) : 0;
+        const airTravelSecs = slicingStatsRef.current ? slicingStatsRef.current.airTimeEst * ratio : 0.0;
+
+        setJobStats({
+          status: isPausedRef.current ? "paused" : "printing",
+          pointsCompleted: payload.global_point_index,
+          totalPoints: payload.total_points,
+          pathsCompleted: payload.path_index,
+          totalPaths: slicedPathsRef.current.length,
+          distanceDrawn: parseFloat(drawM.toFixed(2)),
+          distanceTraveled: parseFloat(travelM.toFixed(2)),
+          elapsedTime: elapsed,
+          estimatedRemaining: remaining,
+          airTravelTime: Math.round(airTravelSecs)
+        });
+      }
     }).then((fn) => {
-      unlistenProgress = fn;
+      if (!active) fn();
+      else unlistenProgress = fn;
     });
 
     listen<string>("ebb-log", (event) => {
       setConsoleLogs(prev => [...prev.slice(-99), event.payload]);
     }).then((fn) => {
-      unlistenLog = fn;
+      if (!active) fn();
+      else unlistenLog = fn;
     });
 
     listen<boolean>("plot-finished", (event) => {
@@ -1034,6 +1235,7 @@ function App() {
       setProgress(null);
       setCurrentPos({ x: 0, y: 0 });
       setIsPenDown(false);
+      setTracingBoundary(null);
       setStatusMsg(aborted ? "Job Aborted" : "Job Finished");
 
       setJobStats((prev) => {
@@ -1044,38 +1246,39 @@ function App() {
       });
       
       // Calculate elapsed time and open completion screen only if not aborted
-      if (!aborted && jobStartTime) {
-        const elapsed = Math.round((Date.now() - jobStartTime) / 1000);
+      if (!aborted && jobStartTimeRef.current) {
+        const elapsed = Math.round((Date.now() - jobStartTimeRef.current) / 1000);
         setActualElapsedSeconds(elapsed);
         setShowFinishedModal(true);
-        setJobStartTime(null);
-      } else {
-        setJobStartTime(null);
       }
+      setJobStartTime(null);
 
       // Add to job history list
-      addToJobHistory(aborted);
+      if (addToJobHistoryRef.current) {
+        addToJobHistoryRef.current(aborted);
+      }
 
       // Update pen profiles distance tracker upon job completion
-      if (slicingStats) {
+      if (slicingStatsRef.current) {
         setPenProfiles(prev => prev.map(p => {
-          if (p.id === activeProfileId) {
+          if (p.id === activeProfileIdRef.current) {
             return {
               ...p,
-              accumulatedDistanceMeters: p.accumulatedDistanceMeters + (slicingStats.drawDist / 1000)
+              accumulatedDistanceMeters: p.accumulatedDistanceMeters + ((slicingStatsRef.current?.drawDist ?? 0) / 1000)
             };
           }
           return p;
         }));
       }
     }).then((fn) => {
-      unlistenFinished = fn;
+      if (!active) fn();
+      else unlistenFinished = fn;
     });
 
     listen<string>("inkscape-import", (event) => {
       const svgText = event.payload;
       try {
-        const parsed = parseSVG(svgText, scaleWidth, scaleHeight);
+        const parsed = parseSVG(svgText, scaleWidthRef.current, scaleHeightRef.current);
         setObjects((prev) => {
           const newObj: SlicerObject = {
             id: `obj-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -1099,16 +1302,18 @@ function App() {
         setStatusMsg(`Import Error: ${err.message}`);
       }
     }).then((fn) => {
-      unlistenInkscape = fn;
+      if (!active) fn();
+      else unlistenInkscape = fn;
     });
 
     return () => {
+      active = false;
       if (unlistenProgress) unlistenProgress();
       if (unlistenFinished) unlistenFinished();
       if (unlistenInkscape) unlistenInkscape();
       if (unlistenLog) unlistenLog();
     };
-  }, [scaleWidth, scaleHeight, originCorner, slicingStats, activeProfileId, jobStartTime]);
+  }, []);
 
   useEffect(() => {
     renderCanvas();
@@ -1420,8 +1625,30 @@ function App() {
       }
     }
 
+    // Draw active tracing boundary box
+    if (tracingBoundary) {
+      ctx.strokeStyle = "rgba(239, 68, 68, 0.85)";
+      ctx.lineWidth = 2 * dpiScale;
+      ctx.setLineDash([8 * dpiScale, 4 * dpiScale]);
+      ctx.strokeRect(
+        scaledPadding + tracingBoundary.minX * scaleX,
+        scaledPadding + tracingBoundary.minY * scaleY,
+        (tracingBoundary.maxX - tracingBoundary.minX) * scaleX,
+        (tracingBoundary.maxY - tracingBoundary.minY) * scaleY
+      );
+      ctx.setLineDash([]);
+      
+      ctx.fillStyle = "rgba(239, 68, 68, 0.85)";
+      ctx.font = `bold ${10 * dpiScale}px sans-serif`;
+      ctx.fillText(
+        "TRACING AREA", 
+        scaledPadding + tracingBoundary.minX * scaleX + 5, 
+        scaledPadding + tracingBoundary.minY * scaleY - 5
+      );
+    }
+
     // Draw selection borders & Drag/Scale/Rotate handles
-    if (activeTab === "prepare" && selectedObjectId) {
+    if ((activeTab === "prepare" || activeTab === "preview") && selectedObjectId) {
       const activeObj = objects.find(o => o.id === selectedObjectId);
       if (activeObj) {
         const bounds = getObjectBounds(activeObj);
@@ -1438,33 +1665,36 @@ function App() {
           );
           ctx.setLineDash([]);
 
-          // Corner Scale Handle (bottom right) - 10px screen size
-          ctx.fillStyle = "#ffffff";
-          ctx.strokeStyle = "var(--accent-color)";
-          ctx.lineWidth = 3;
-          ctx.fillRect(scaledPadding + bounds.maxX * scaleX - 6, scaledPadding + bounds.maxY * scaleY - 6, 12, 12);
-          ctx.strokeRect(scaledPadding + bounds.maxX * scaleX - 6, scaledPadding + bounds.maxY * scaleY - 6, 12, 12);
+          // Handles only in prepare tab
+          if (activeTab === "prepare") {
+            // Corner Scale Handle (bottom right) - 10px screen size
+            ctx.fillStyle = "#ffffff";
+            ctx.strokeStyle = "var(--accent-color)";
+            ctx.lineWidth = 3;
+            ctx.fillRect(scaledPadding + bounds.maxX * scaleX - 6, scaledPadding + bounds.maxY * scaleY - 6, 12, 12);
+            ctx.strokeRect(scaledPadding + bounds.maxX * scaleX - 6, scaledPadding + bounds.maxY * scaleY - 6, 12, 12);
 
-          // Rotate Handle (top middle extended)
-          const rotX = (bounds.minX + bounds.maxX) / 2;
-          const rotY = bounds.minY - 15;
-          ctx.beginPath();
-          ctx.moveTo(scaledPadding + rotX * scaleX, scaledPadding + bounds.minY * scaleY);
-          ctx.lineTo(scaledPadding + rotX * scaleX, scaledPadding + rotY * scaleY);
-          ctx.stroke();
+            // Rotate Handle (top middle extended)
+            const rotX = (bounds.minX + bounds.maxX) / 2;
+            const rotY = bounds.minY - 15;
+            ctx.beginPath();
+            ctx.moveTo(scaledPadding + rotX * scaleX, scaledPadding + bounds.minY * scaleY);
+            ctx.lineTo(scaledPadding + rotX * scaleX, scaledPadding + rotY * scaleY);
+            ctx.stroke();
 
-          ctx.beginPath();
-          ctx.arc(scaledPadding + rotX * scaleX, scaledPadding + rotY * scaleY, 8, 0, 2 * Math.PI);
-          ctx.fill();
-          ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(scaledPadding + rotX * scaleX, scaledPadding + rotY * scaleY, 8, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.stroke();
+          }
         }
       }
     }
 
     // Draw Home Origin Target Indicator (permanent CAD-style crosshair visual aid)
     if (activeTab === "prepare") {
-      const homeX = originCorner === "top-right" ? scaleWidth : 0;
-      const homeY = 0;
+      const homeX = invertX ? scaleWidth : 0;
+      const homeY = invertY ? scaleHeight : 0;
       
       // Outer hollow ring
       ctx.beginPath();
@@ -1530,7 +1760,7 @@ function App() {
 
   // Mouse drag handles / translate logic
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (activeTab === "preview" || activeTab === "monitor") return; // Freeze dragging in Preview/Monitor
+    if (activeTab === "monitor") return; // Freeze entirely in Monitor
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1541,6 +1771,29 @@ function App() {
     // Shift coordinates by CANVAS_PADDING to map directly to millimeters
     const mmX = ((clientX - CANVAS_PADDING) / (rect.width - CANVAS_PADDING * 2)) * scaleWidth;
     const mmY = ((clientY - CANVAS_PADDING) / (rect.height - CANVAS_PADDING * 2)) * scaleHeight;
+
+    if (activeTab === "preview") {
+      // Click selection only, no drag/scale/rotate
+      let clickedObjId: string | null = null;
+      for (let i = objects.length - 1; i >= 0; i--) {
+        const obj = objects[i];
+        const bounds = getObjectBounds(obj);
+        if (!bounds) continue;
+        const padding = 5;
+        if (mmX >= bounds.minX - padding && mmX <= bounds.maxX + padding && mmY >= bounds.minY - padding && mmY <= bounds.maxY + padding) {
+          clickedObjId = obj.id;
+          break;
+        }
+      }
+      if (clickedObjId) {
+        if (!selectedObjectIds.includes(clickedObjId)) {
+          setSelectedObjectIds([clickedObjId]);
+        }
+      } else {
+        setSelectedObjectIds([]);
+      }
+      return;
+    }
 
     // Check handles of selected object first
     if (selectedObjectId) {
@@ -1815,6 +2068,8 @@ function App() {
     const minY = margin;
     const maxY = scaleHeight - margin;
 
+    setTracingBoundary({ minX, maxX, minY, maxY });
+
     // Corner ordering depending on origin corner (starts closest to home corner)
     let corners = [];
     if (originCorner === "top-right") {
@@ -1853,6 +2108,87 @@ function App() {
     } catch (err: any) {
       setStatusMsg(`Frame trace failed: ${err}`);
       setIsPlotting(false);
+      setTracingBoundary(null);
+    }
+  };
+
+  const handleTraceDesignBoundary = async () => {
+    if (!connected) {
+      setStatusMsg("Please connect to AxiDraw first");
+      return;
+    }
+
+    const targetIds = selectedObjectIds.length > 0 
+      ? selectedObjectIds 
+      : objects.map(o => o.id);
+
+    if (targetIds.length === 0) {
+      setStatusMsg("No designs to trace!");
+      return;
+    }
+
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+
+    targetIds.forEach(id => {
+      const obj = objects.find(o => o.id === id);
+      if (obj) {
+        const bounds = getObjectBounds(obj);
+        if (bounds) {
+          if (bounds.minX < minX) minX = bounds.minX;
+          if (bounds.maxX > maxX) maxX = bounds.maxX;
+          if (bounds.minY < minY) minY = bounds.minY;
+          if (bounds.maxY > maxY) maxY = bounds.maxY;
+        }
+      }
+    });
+
+    if (minX === Infinity || minY === Infinity) {
+      setStatusMsg("Cannot compute bounds of selected designs");
+      return;
+    }
+
+    setTracingBoundary({ minX, maxX, minY, maxY });
+
+    // Corner ordering depending on origin corner (starts closest to home corner)
+    let corners = [];
+    if (originCorner === "top-right") {
+      // Home is top-right (scaleWidth, 0) -> closest margin corner is (maxX, minY)
+      corners = [
+        { x: maxX, y: minY },
+        { x: minX, y: minY },
+        { x: minX, y: maxY },
+        { x: maxX, y: maxY },
+        { x: maxX, y: minY }
+      ];
+    } else {
+      // Home is top-left (0,0) -> closest margin corner is (minX, minY)
+      corners = [
+        { x: minX, y: minY },
+        { x: maxX, y: minY },
+        { x: maxX, y: maxY },
+        { x: minX, y: maxY },
+        { x: minX, y: minY }
+      ];
+    }
+
+    // Convert coordinates to hardware motor mapping space, respecting invertX/invertY
+    const mirroredCorners = corners.map((pt) => ({
+      x: invertX ? scaleWidth - pt.x : pt.x,
+      y: invertY ? scaleHeight - pt.y : pt.y,
+    }));
+
+    // Apply speed multiplier override factor
+    const activeJogSpeed = jogSpeed * (speedMultiplier / 100);
+
+    try {
+      setStatusMsg("Tracing design boundaries...");
+      setIsPlotting(true);
+      await invoke("run_frame_preview", { points: mirroredCorners, speed: activeJogSpeed });
+    } catch (err: any) {
+      setStatusMsg(`Design trace failed: ${err}`);
+      setIsPlotting(false);
+      setTracingBoundary(null);
     }
   };
 
@@ -1878,14 +2214,14 @@ function App() {
     }
   };
 
-  const addToJobHistory = (aborted: boolean) => {
+  function addToJobHistory(aborted: boolean) {
     const jobName = objects.length > 0 
       ? objects.map(o => o.name).join(", ") 
       : "Custom Plot Job";
     
     const newJob: PastJob = {
       id: `job-${Date.now()}`,
-      name: jobName.length > 40 ? jobName.substring(0, 37) + "..." : jobName,
+      name: jobName,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       paths: slicedPaths.length > 0 ? [...slicedPaths] : getProcessedToolpaths(),
       stats: slicingStats,
@@ -1893,7 +2229,7 @@ function App() {
     };
     
     setJobHistory(prev => [newJob, ...prev.slice(0, 9)]);
-  };
+  }
 
   const handleRelaunchJob = async (job: PastJob) => {
     if (!connected) {
@@ -1951,7 +2287,8 @@ function App() {
 
   // Stop plotting: halts steppers, raises pen, releases motors, and homes pen back to origin
   const handleStopPlot = async () => {
-    setStatusMsg("Stopping plot... Raising pen and returning home...");
+    setStatusMsg("Stop registered. Completing current stroke before returning home...");
+    setTracingBoundary(null);
     try {
       await invoke("stop_plot"); // halts active moves instantly
       setIsPlotting(false);
@@ -1959,7 +2296,6 @@ function App() {
       setIsPenDown(false);
       setJobStartTime(null);
       setJobStats(prev => ({ ...prev, status: "aborted" }));
-      setStatusMsg("Plot Stopped. Returning home...");
     } catch (err: any) {
       console.error(err);
       setStatusMsg(`Stop failed: ${err}`);
@@ -2230,6 +2566,68 @@ function App() {
                 )}
               </div>
 
+              {/* Raster settings if image */}
+              {fileType === "image" && (
+                <div className="card-section">
+                  <h3 className="card-title">Vectorizer Settings</h3>
+                  
+                  <div className="form-group">
+                    <label>Algorithm</label>
+                    <select value={algorithm} onChange={(e) => setAlgorithm(e.target.value)}>
+                      <option value="sketch">Sketch (Squiggle)</option>
+                      <option value="hatch">Hatching (Waves)</option>
+                      <option value="tsp">TSP (Continuous Line)</option>
+                      <option value="outline">Outline (Line Art)</option>
+                      <option value="crosshatch">Cross-Hatching (Waves)</option>
+                    </select>
+                  </div>
+
+                  {(algorithm === "sketch" || algorithm === "tsp") && (
+                    <div className="slider-group">
+                      <div className="slider-header">
+                        <label>{algorithm === "tsp" ? "Stipple points" : "Density/Max lines"}</label>
+                        <span className="slider-val">{maxLines}</span>
+                      </div>
+                      <input type="range" min="100" max="4000" step="50" value={maxLines} onChange={(e) => setMaxLines(parseInt(e.target.value))} />
+                    </div>
+                  )}
+
+                  {(algorithm === "hatch" || algorithm === "crosshatch") && (
+                    <div className="slider-group">
+                      <div className="slider-header">
+                        <label>Line frequency</label>
+                        <span className="slider-val">{lineDensity}</span>
+                      </div>
+                      <input type="range" min="1.0" max="10.0" step="0.5" value={lineDensity} onChange={(e) => setLineDensity(parseFloat(e.target.value))} />
+                    </div>
+                  )}
+
+                  <div className="slider-group">
+                    <div className="slider-header">
+                      <label>Computing resolution</label>
+                      <span className="slider-val">{resolution}px</span>
+                    </div>
+                    <input type="range" min="200" max="1000" step="50" value={resolution} onChange={(e) => setResolution(parseInt(e.target.value))} />
+                  </div>
+
+                  <button className="btn btn-primary" onClick={handleGenerateToolpath} disabled={isGenerating}>
+                    {isGenerating ? "Processing..." : "Generate toolpath"}
+                  </button>
+
+                  {selectedObject && selectedObject.name.startsWith("Vectorizer:") && selectedObject.scale !== 100 && (
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={handleOptimizeVectorizerScale} 
+                      disabled={isGenerating}
+                      style={{ marginTop: "10px", width: "100%", border: "1px solid var(--accent-color)" }}
+                      title="Regenerate vector paths at current scale to optimize path density"
+                    >
+                      Optimize Density to Scale ({Math.round(selectedObject.scale)}%)
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Bed Size Settings */}
               <div className="card-section">
                 <h3 className="card-title">Bed Layout</h3>
@@ -2291,6 +2689,7 @@ function App() {
                 <div className="form-group">
                   <label>Active Pen Profile</label>
                   <select value={activeProfileId} onChange={(e) => setActiveProfileId(e.target.value)}>
+                    <option value="">-- No Active Pen Profile --</option>
                     {penProfiles.map(p => (
                       <option key={p.id} value={p.id}>{p.name} ({p.capacityMeters}m)</option>
                     ))}
@@ -2345,52 +2744,6 @@ function App() {
                 </div>
               </div>
 
-              {/* Raster settings if image */}
-              {fileType === "image" && (
-                <div className="card-section">
-                  <h3 className="card-title">Vectorizer Settings</h3>
-                  
-                  <div className="form-group">
-                    <label>Algorithm</label>
-                    <select value={algorithm} onChange={(e) => setAlgorithm(e.target.value)}>
-                      <option value="sketch">Sketch (Squiggle)</option>
-                      <option value="hatch">Hatching (Waves)</option>
-                      <option value="tsp">TSP (Continuous Line)</option>
-                    </select>
-                  </div>
-
-                  <div className="slider-group">
-                    <div className="slider-header">
-                      <label>{algorithm === "tsp" ? "Stipple points" : "Density/Max lines"}</label>
-                      <span className="slider-val">{maxLines}</span>
-                    </div>
-                    <input type="range" min="100" max="4000" step="50" value={maxLines} onChange={(e) => setMaxLines(parseInt(e.target.value))} />
-                  </div>
-
-                  {algorithm === "hatch" && (
-                    <div className="slider-group">
-                      <div className="slider-header">
-                        <label>Line frequency</label>
-                        <span className="slider-val">{lineDensity}</span>
-                      </div>
-                      <input type="range" min="1.0" max="10.0" step="0.5" value={lineDensity} onChange={(e) => setLineDensity(parseFloat(e.target.value))} />
-                    </div>
-                  )}
-
-                  <div className="slider-group">
-                    <div className="slider-header">
-                      <label>Computing resolution</label>
-                      <span className="slider-val">{resolution}px</span>
-                    </div>
-                    <input type="range" min="200" max="1000" step="50" value={resolution} onChange={(e) => setResolution(parseInt(e.target.value))} />
-                  </div>
-
-                  <button className="btn btn-primary" onClick={handleGenerateToolpath} disabled={isGenerating}>
-                    {isGenerating ? "Processing..." : "Generate toolpath"}
-                  </button>
-                </div>
-              )}
-
               {objects.length > 0 && (
                 <button className="btn btn-success" onClick={handleSlice} style={{ marginTop: "10px" }}>
                   Slice & preview toolpath
@@ -2407,7 +2760,7 @@ function App() {
                 <h3 className="card-title">Slicing Estimates</h3>
                 <div className="stats-list">
                   <div className="stats-row">
-                    <span>Estimated time:</span>
+                    <span>Estimated time (total):</span>
                     <span className="stats-val" style={{ color: "var(--success)" }}>{formatTime(slicingStats.timeEst)}</span>
                   </div>
                   <div className="stats-row">
@@ -2428,6 +2781,10 @@ function App() {
                       {((slicingStats.drawDist / 1000) / penCapacityMeters * 100).toFixed(2)}% of pen
                     </span>
                   </div>
+                </div>
+
+                <div style={{ fontSize: "0.68rem", color: "var(--text-muted)", marginTop: "10px", fontStyle: "italic", borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: "8px" }}>
+                  * Estimated time includes total drawing time, air travel time, and pen delay overhead.
                 </div>
 
                 {/* Simulated drawing sequence slider */}
@@ -2497,9 +2854,12 @@ function App() {
                 <div className="card-section">
                   <h3 className="card-title">Job Execution</h3>
                   
-                  <div className="form-row" style={{ marginBottom: "10px" }}>
-                    <button className="btn btn-secondary" onClick={handleTraceFrame} disabled={isPlotting}>
-                      Trace frame boundary
+                  <div className="form-row" style={{ gap: "8px", marginBottom: "10px" }}>
+                    <button className="btn btn-secondary" onClick={handleTraceFrame} disabled={isPlotting} style={{ flex: 1, padding: "6px 4px", fontSize: "0.75rem" }}>
+                      Trace page margins
+                    </button>
+                    <button className="btn btn-secondary" onClick={handleTraceDesignBoundary} disabled={isPlotting || objects.length === 0} style={{ flex: 1, padding: "6px 4px", fontSize: "0.75rem" }}>
+                      Trace designs boundary
                     </button>
                   </div>
 
@@ -2537,6 +2897,20 @@ function App() {
                           X: {currentPos.x.toFixed(1)}mm | Y: {currentPos.y.toFixed(1)}mm
                         </div>
                       )}
+                    </div>
+                  )}
+                  {statusMsg && (
+                    <div style={{ 
+                      marginTop: "12px", 
+                      padding: "8px 12px", 
+                      borderRadius: "6px", 
+                      fontSize: "0.75rem", 
+                      fontFamily: "monospace",
+                      backgroundColor: "var(--bg-primary)", 
+                      borderLeft: "3px solid var(--accent-color)", 
+                      color: "var(--text-secondary)" 
+                    }}>
+                      Status: {statusMsg}
                     </div>
                   )}
                 </div>
@@ -2629,9 +3003,11 @@ function App() {
 
         {/* CENTER VIEWPORT */}
         {activeTab !== "monitor" ? (
-          <div style={{ flex: 1, position: "relative", display: "flex", flexDirection: "column", height: "100%", width: "100%", overflow: "hidden" }}>
+          <div style={{ flex: 1, minWidth: 0, position: "relative", display: "flex", flexDirection: "column", height: "100%", width: "100%", overflow: "hidden" }}>
+            
+            {/* Scrollable Canvas area */}
             <main 
-              ref={prepareScrollContainerRef}
+              ref={prepareScrollContainerCallback}
               className="canvas-container" 
               onMouseDown={handlePrepareMouseDown}
               onMouseMove={handlePrepareMouseMove}
@@ -2640,37 +3016,35 @@ function App() {
               onContextMenu={(e) => {
                 if (isPanningPrepare) e.preventDefault();
               }}
-              style={{ display: "flex", flexDirection: "column", gap: "10px", overflow: "auto", alignItems: "center", width: "100%", height: "100%" }}
+              style={{ display: "flex", flexDirection: "column", gap: "15px", overflow: "auto", alignItems: "center", width: "100%", height: "100%", padding: "20px 10px", boxSizing: "border-box" }}
             >
-              
-              <div style={{ width: `${Math.max(1260, totalCanvasWidth * zoom)}px`, display: "flex", flexDirection: "column", gap: "10px", alignItems: "center" }}>
-              {/* Horizontal Slicing Toolbar */}
+              {/* Horizontal Slicing Toolbar - aligned at bed level, matching bed width */}
               <div 
                 style={{ 
                   display: "flex", 
                   alignItems: "center", 
-                  justifyContent: "space-evenly", 
+                  justifyContent: "center", 
                   backgroundColor: "var(--bg-secondary)", 
                   border: "1px solid var(--border-color)", 
                   borderRadius: "8px", 
                   padding: "10px 16px",
-                  width: "100%",
+                  width: "fit-content",
+                  minWidth: `${totalCanvasWidth * zoom}px`,
                   boxSizing: "border-box",
                   flexWrap: "nowrap",
-                  position: "sticky",
-                  top: "10px",
-                  zIndex: 10
+                  gap: "15px",
+                  flexShrink: 0
                 }}
               >
-                {/* Clipboard group (Locked in Preview Tab, Grised if no selection) */}
-                <div style={{ display: "flex", gap: "6px" }}>
-                  <button className="btn btn-secondary" onClick={handleCopy} disabled={activeTab === "preview" || !selectedObjectId} style={{ padding: "4px 10px", fontSize: "0.8rem" }}>
+                {/* Clipboard actions */}
+                <div style={{ display: "flex", gap: "4px", flexShrink: 0, flexWrap: "nowrap" }}>
+                  <button className="btn btn-secondary" onClick={handleCopy} disabled={activeTab === "preview" || !selectedObjectId} style={{ padding: "4px 8px", fontSize: "0.75rem" }}>
                     Copy
                   </button>
-                  <button className="btn btn-secondary" onClick={handleCut} disabled={activeTab === "preview" || !selectedObjectId} style={{ padding: "4px 10px", fontSize: "0.8rem" }}>
+                  <button className="btn btn-secondary" onClick={handleCut} disabled={activeTab === "preview" || !selectedObjectId} style={{ padding: "4px 8px", fontSize: "0.75rem" }}>
                     Cut
                   </button>
-                  <button className="btn btn-secondary" onClick={handlePaste} disabled={activeTab === "preview" || !clipboard} style={{ padding: "4px 10px", fontSize: "0.8rem" }}>
+                  <button className="btn btn-secondary" onClick={handlePaste} disabled={activeTab === "preview" || !clipboard} style={{ padding: "4px 8px", fontSize: "0.75rem" }}>
                     Paste
                   </button>
                   <button 
@@ -2684,7 +3058,7 @@ function App() {
                       }
                     }} 
                     disabled={activeTab === "preview" || selectedObjectIds.length === 0} 
-                    style={{ padding: "4px 10px", fontSize: "0.8rem", backgroundColor: "rgba(239, 68, 68, 0.15)", color: "var(--danger)", border: "1px solid rgba(239, 68, 68, 0.3)" }}
+                    style={{ padding: "4px 8px", fontSize: "0.75rem", backgroundColor: "rgba(239, 68, 68, 0.15)", color: "var(--danger)", border: "1px solid rgba(239, 68, 68, 0.3)" }}
                   >
                     Delete
                   </button>
@@ -2694,11 +3068,11 @@ function App() {
                 <div style={{ width: "1px", height: "24px", backgroundColor: "var(--border-color)", flexShrink: 0 }} />
 
                 {/* Arrange group */}
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <button className="btn btn-secondary" onClick={handleArrangeAll} disabled={activeTab === "preview" || objects.length === 0} style={{ padding: "4px 12px", fontSize: "0.8rem" }}>
-                    Auto-Arrange Designs
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, flexWrap: "nowrap" }}>
+                  <button className="btn btn-secondary" onClick={handleArrangeAll} disabled={activeTab === "preview" || objects.length === 0} style={{ padding: "4px 10px", fontSize: "0.75rem" }}>
+                    Auto-Arrange
                   </button>
-                  <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "0.72rem", fontWeight: "normal", cursor: "pointer", userSelect: "none", color: "var(--text-secondary)" }} title="Allow resizing objects to fit cells during layout optimization">
+                  <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "0.72rem", fontWeight: "normal", cursor: "pointer", userSelect: "none", color: "var(--text-secondary)", whiteSpace: "nowrap" }} title="Allow resizing objects to fit cells during layout optimization">
                     <input type="checkbox" checked={allowArrangeResize} onChange={(e) => setAllowArrangeResize(e.target.checked)} disabled={activeTab === "preview"} />
                     Auto-Scale
                   </label>
@@ -2707,10 +3081,10 @@ function App() {
                 {/* Vertical Divider */}
                 <div style={{ width: "1px", height: "24px", backgroundColor: "var(--border-color)", flexShrink: 0 }} />
 
-                {/* Scale / Rotate Numeric Inputs group (with typeable buffer state to prevent auto-snapping) */}
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                    <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Scale:</span>
+                {/* Scale / Rotate / Flip actions */}
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", flexShrink: 0, flexWrap: "nowrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "nowrap" }}>
+                    <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Scale:</span>
                     <input 
                       type="number" 
                       value={inputScaleText} 
@@ -2725,15 +3099,17 @@ function App() {
                           setSlicedPaths([]);
                         }
                       }}
-                      style={{ width: "65px", padding: "4px 8px", fontSize: "0.8rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                      style={{ width: "45px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
                     />
-                    <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>%</span>
+                    <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>%</span>
                   </div>
 
-                  <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                    <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Rot:</span>
-                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("left")}>-90</button>
-                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("right")}>+90</button>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "nowrap" }}>
+                    <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Rot/Flip:</span>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("left")} title="Rotate 90° CCW">-90°</button>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("right")} title="Rotate 90° CW">+90°</button>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => flipObject("horizontal")} title="Flip horizontally">Flip H</button>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => flipObject("vertical")} title="Flip vertically">Flip V</button>
                     <input 
                       type="number" 
                       value={inputRotationText} 
@@ -2748,73 +3124,36 @@ function App() {
                           setSlicedPaths([]);
                         }
                       }}
-                      style={{ width: "55px", padding: "4px 8px", fontSize: "0.8rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                      style={{ width: "40px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
                     />
-                    <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>°</span>
+                    <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>°</span>
                   </div>
-                </div>
-
-                {/* Vertical Divider */}
-                <div style={{ width: "1px", height: "24px", backgroundColor: "var(--border-color)", flexShrink: 0 }} />
-
-                {/* Bed Setup Group */}
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                    <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Bed:</span>
-                    <select 
-                      value={bedPreset}
-                      onChange={(e) => { handleBedPresetChange(e.target.value); setBedPreset(e.target.value); }}
-                      disabled={activeTab === "preview"}
-                      style={{ padding: "4px 8px", fontSize: "0.8rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
-                    >
-                      <option value="">Custom</option>
-                      <option value="A4">A4</option>
-                      <option value="A3">A3</option>
-                      <option value="A2">A2</option>
-                      <option value="A1">A1</option>
-                      <option value="A5">A5</option>
-                      <option value="A6">A6</option>
-                      <option value="A7">A7</option>
-                    </select>
-                  </div>
-
-                  <select 
-                    value={orientation} 
-                    disabled={activeTab === "preview"}
-                    onChange={(e) => handleOrientationToggle(e.target.value as "landscape" | "portrait")}
-                    style={{ padding: "4px 8px", fontSize: "0.8rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
-                  >
-                    <option value="landscape">Landscape</option>
-                    <option value="portrait">Portrait</option>
-                  </select>
                 </div>
 
                 {/* Vertical Divider */}
                 <div style={{ width: "1px", height: "24px", backgroundColor: "var(--border-color)", flexShrink: 0 }} />
 
                 {/* Dynamic Zoom Section */}
-                <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                  <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Zoom:</span>
-                  <button className="btn btn-secondary" style={{ padding: "2px 8px", fontSize: "0.8rem" }} onClick={() => setZoom(prev => Math.max(1.0, prev - 0.25))}>-</button>
-                  <span style={{ fontSize: "0.8rem", minWidth: "40px", textAlign: "center" }}>{Math.round(zoom * 100)}%</span>
-                  <button className="btn btn-secondary" style={{ padding: "2px 8px", fontSize: "0.8rem" }} onClick={() => setZoom(prev => Math.min(5.0, prev + 0.25))}>+</button>
+                <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0, flexWrap: "nowrap" }}>
+                  <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Zoom:</span>
+                  <button className="btn btn-secondary" style={{ padding: "2px 8px", fontSize: "0.75rem" }} onClick={() => setZoom(prev => Math.max(1.0, prev - 0.25))}>-</button>
+                  <span style={{ fontSize: "0.75rem", minWidth: "35px", textAlign: "center" }}>{Math.round(zoom * 100)}%</span>
+                  <button className="btn btn-secondary" style={{ padding: "2px 8px", fontSize: "0.75rem" }} onClick={() => setZoom(prev => Math.min(5.0, prev + 0.25))}>+</button>
                   <button 
                     className="btn btn-secondary" 
-                    style={{ padding: "2px 8px", fontSize: "0.8rem", marginLeft: "4px" }} 
+                    style={{ padding: "2px 8px", fontSize: "0.75rem", marginLeft: "4px" }} 
                     onClick={() => {
                       if (prepareScrollContainerRef.current) {
                         const container = prepareScrollContainerRef.current;
                         const containerPadding = 40;
                         const availableWidth = container.clientWidth - containerPadding;
-                        const availableHeight = container.clientHeight - containerPadding - 80; // accounts for horizontal toolbar height
+                        const availableHeight = container.clientHeight - containerPadding - 80;
                         
                         const zoomX = availableWidth / totalCanvasWidth;
                         const zoomY = availableHeight / totalCanvasHeight;
                         
                         let idealZoom = Math.min(zoomX, zoomY);
                         idealZoom = Math.max(0.5, Math.min(5.0, idealZoom));
-                        
-                        // Round to nearest 0.05
                         idealZoom = Math.round(idealZoom * 20) / 20;
                         
                         setZoom(idealZoom);
@@ -2829,7 +3168,6 @@ function App() {
                     Fit
                   </button>
                 </div>
-
               </div>
 
               {/* White Paper Sheet Zooms with controls, while Container handles scrolling */}
@@ -2842,7 +3180,8 @@ function App() {
                   transition: "width 0.1s ease, height 0.1s ease",
                   backgroundColor: "transparent", 
                   position: "relative",
-                  overflow: "hidden"
+                  overflow: "hidden",
+                  flexShrink: 0
                 }}
               >
                 <canvas
@@ -2857,15 +3196,14 @@ function App() {
                   onMouseLeave={handleCanvasMouseUp}
                 />
               </div>
+            </main>
+            <div className="canvas-scale-indicator" style={{ position: "absolute", bottom: "20px", right: "20px", zIndex: 20 }}>
+              Bed: {scaleWidth}mm x {scaleHeight}mm
             </div>
-          </main>
-          <div className="canvas-scale-indicator" style={{ position: "absolute", bottom: "20px", right: "20px", zIndex: 20 }}>
-            Bed: {scaleWidth}mm x {scaleHeight}mm
           </div>
-        </div>
         ) : (
           /* MONITOR TAB CENTER VIEWPORT: Dedicated Fluidd Dashboard */
-          <main style={{ flex: 1, padding: "20px", display: "flex", flexDirection: "column", gap: "20px", overflowY: "auto" }}>
+          <main style={{ flex: 1, minWidth: 0, padding: "20px", display: "flex", flexDirection: "column", gap: "20px", overflowY: "auto" }}>
             
             {/* Top part: Two Columns side-by-side */}
             <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: "20px", alignItems: "stretch", width: "100%" }}>
@@ -2969,8 +3307,8 @@ function App() {
                             borderRadius: "6px" 
                           }}
                         >
-                          <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-                            <span style={{ fontSize: "0.85rem", fontWeight: "bold", color: "var(--text-primary)" }}>
+                          <div style={{ display: "flex", flexDirection: "column", gap: "2px", flex: 1, minWidth: 0, marginRight: "12px" }}>
+                            <span style={{ fontSize: "0.85rem", fontWeight: "bold", color: "var(--text-primary)", overflowWrap: "anywhere", wordBreak: "break-word" }}>
                               {job.name}
                             </span>
                             <span style={{ fontSize: "0.7rem", color: "var(--text-secondary)" }}>
@@ -3026,7 +3364,7 @@ function App() {
                   
                   {/* Visualizer canvas representing real-time print tracking */}
                   <div 
-                    ref={monitorCanvasContainerRef}
+                    ref={monitorCanvasContainerCallback}
                     onMouseDown={handleMonitorMouseDown}
                     onMouseMove={handleMonitorMouseMove}
                     onMouseUp={handleMonitorMouseUp}
@@ -3131,16 +3469,20 @@ function App() {
                 </div>
 
                 <div style={{ backgroundColor: "var(--bg-primary)", padding: "10px 14px", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
-                  <div style={{ fontSize: "0.7rem", color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Time Elapsed</div>
+                  <div style={{ fontSize: "0.7rem", color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Time Elapsed (total)</div>
                   <strong style={{ fontSize: "1.2rem" }}>{formatTime(jobStats.elapsedTime)}</strong>
                 </div>
 
                 <div style={{ backgroundColor: "var(--bg-primary)", padding: "10px 14px", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
-                  <div style={{ fontSize: "0.7rem", color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Est. Remaining</div>
+                  <div style={{ fontSize: "0.7rem", color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Est. Remaining (total)</div>
                   <strong style={{ fontSize: "1.2rem", color: jobStats.status === "printing" ? "var(--success)" : "var(--text-muted)" }}>
                     {jobStats.status === "printing" ? formatTime(jobStats.estimatedRemaining) : "0m 0s"}
                   </strong>
                 </div>
+              </div>
+              
+              <div style={{ fontSize: "0.68rem", color: "var(--text-muted)", marginTop: "10px", fontStyle: "italic", padding: "0 5px" }}>
+                * Estimated Remaining and Time Elapsed represent total job durations, including both drawing and air travel phases.
               </div>
             </div>
 
@@ -3285,7 +3627,7 @@ function App() {
       </div>
 
       {/* JOB COMPLETED NOTIFICATION MODAL: Premium Dark Telemetry View */}
-      {showFinishedModal && slicingStats && (
+      {showFinishedModal && (
         <div 
           style={{ 
             position: "fixed", 
@@ -3324,20 +3666,23 @@ function App() {
                 <strong style={{ color: "var(--success)" }}>{formatTime(actualElapsedSeconds)}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderTop: "1px solid var(--border-color)" }}>
-                <span>Estimated time:</span>
-                <strong>{formatTime(slicingStats.timeEst)}</strong>
+                <span>Estimated time (total):</span>
+                <strong>{slicingStats ? formatTime(slicingStats.timeEst) : "0m 0s"}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}>
                 <span>Draw distance:</span>
-                <strong>{((slicingStats.drawDist) / 1000).toFixed(2)} m</strong>
+                <strong>{slicingStats ? (slicingStats.drawDist / 1000).toFixed(2) : "0.00"} m</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}>
                 <span>Air travel:</span>
-                <strong>{((slicingStats.airDist) / 1000).toFixed(2)} m</strong>
+                <strong>
+                  {slicingStats ? (slicingStats.airDist / 1000).toFixed(2) : "0.00"} m 
+                  {slicingStats && slicingStats.airTimeEst !== undefined ? ` (${formatTime(slicingStats.airTimeEst)})` : ""}
+                </strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}>
                 <span>Pen lifts:</span>
-                <strong>{slicingStats.numLifts}</strong>
+                <strong>{slicingStats ? slicingStats.numLifts : 0}</strong>
               </div>
             </div>
 

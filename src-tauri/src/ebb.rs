@@ -125,6 +125,31 @@ impl EbbDriver {
         Ok(())
     }
 
+    pub fn move_relative_steps(&mut self, steps_x: i32, steps_y: i32, speed_mm_s: f32) -> Result<(), String> {
+        if steps_x == 0 && steps_y == 0 {
+            return Ok(());
+        }
+
+        // Calculate travel distance in mm
+        let dx_mm = steps_x as f32 / STEPS_PER_MM;
+        let dy_mm = steps_y as f32 / STEPS_PER_MM;
+        let distance = (dx_mm.powi(2) + dy_mm.powi(2)).sqrt();
+        
+        // Calculate duration in ms
+        let mut duration_ms = ((distance / speed_mm_s) * 1000.0).round() as u32;
+        if duration_ms < 1 {
+            duration_ms = 1;
+        }
+
+        let cmd = format!("XM,{},{},{}", duration_ms, steps_x, steps_y);
+        let response = self.send_command(&cmd)?;
+        if response != "OK" {
+            return Err(format!("Move command failed: {}", response));
+        }
+
+        Ok(())
+    }
+
     pub fn clear_motion(&mut self) -> Result<(), String> {
         let response = self.send_command("CM")?;
         if response != "OK" {

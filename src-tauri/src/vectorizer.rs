@@ -37,6 +37,8 @@ pub fn vectorize_image(image_bytes: &[u8], settings: &VectorizerSettings) -> Res
         "sketch" => run_sketch(&img_gray, settings, target_w, target_h),
         "hatch" => run_hatch(&img_gray, settings, target_w, target_h),
         "tsp" => run_tsp(&img_gray, settings, target_w, target_h),
+        "outline" => run_outline(&img_gray, settings, target_w, target_h),
+        "crosshatch" => run_crosshatch(&img_gray, settings, target_w, target_h),
         _ => Err("Unknown algorithm".to_string()),
     }
 }
@@ -318,6 +320,127 @@ fn run_tsp(
         .collect();
 
     Ok(vec![Toolpath { points: physical_points }])
+}
+
+/// 4. OUTLINE / CANNY-STYLE EDGE DETECTOR & CONTOUR TRACER
+fn run_outline(
+    img: &ImageBuffer<Luma<u8>, Vec<u8>>,
+    settings: &VectorizerSettings,
+    w: u32,
+    h: u32,
+) -> Result<Vec<Toolpath>, String> {
+    let mut edge_map = vec![false; (w * h) as usize];
+    let threshold = 50.0f32;
+
+    for y in 1..h-1 {
+        for x in 1..w-1 {
+            let px00 = img.get_pixel(x - 1, y - 1)[0] as f32;
+            let px01 = img.get_pixel(x, y - 1)[0] as f32;
+            let px02 = img.get_pixel(x + 1, y - 1)[0] as f32;
+            let px10 = img.get_pixel(x - 1, y)[0] as f32;
+            let px12 = img.get_pixel(x + 1, y)[0] as f32;
+            let px20 = img.get_pixel(x - 1, y + 1)[0] as f32;
+            let px21 = img.get_pixel(x, y + 1)[0] as f32;
+            let px22 = img.get_pixel(x + 1, y + 1)[0] as f32;
+
+            let gx = -px00 + px02 - 2.0 * px10 + 2.0 * px12 - px20 + px22;
+            let gy = -px00 - 2.0 * px01 - px02 + px20 + 2.0 * px21 + px22;
+            let mag = (gx*gx + gy*gy).sqrt();
+
+            if mag > threshold {
+                edge_map[(y * w + x) as usize] = true;
+            }
+        }
+    }
+
+    let mut toolpaths = Vec::new();
+    let mut visited = vec![false; (w * h) as usize];
+
+    for y in 1..h-1 {
+        for x in 1..w-1 {
+            let idx = (y * w + x) as usize;
+            if edge_map[idx] && !visited[idx] {
+                let mut path_points = Vec::new();
+                let mut curr_x = x;
+                let mut curr_y = y;
+                visited[idx] = true;
+                path_points.push(to_physical(curr_x as f32, curr_y as f32, w, h, settings.scale_width, settings.scale_height));
+
+                loop {
+                    let mut next_pixel = None;
+                    'neighborhood: for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if dx == 0 && dy == 0 { continue; }
+                            let nx = curr_x as i32 + dx;
+                            let ny = curr_y as i32 + dy;
+                            if nx >= 1 && nx < w as i32 - 1 && ny >= 1 && ny < h as i32 - 1 {
+                                let n_idx = (ny as u32 * w + nx as u32) as usize;
+                                if edge_map[n_idx] && !visited[n_idx] {
+                                    next_pixel = Some((nx as u32, ny as u32, n_idx));
+                                    break 'neighborhood;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((nx, ny, n_idx)) = next_pixel {
+                        visited[n_idx] = true;
+                        curr_x = nx;
+                        curr_y = ny;
+                        path_points.push(to_physical(curr_x as f32, curr_y as f32, w, h, settings.scale_width, settings.scale_height));
+                    } else {
+                        break;
+                    }
+                }
+
+                if path_points.len() > 2 {
+                    toolpaths.push(Toolpath { points: path_points });
+                }
+            }
+        }
+    }
+
+    Ok(toolpaths)
+}
+
+/// 5. CROSSHATCH / DOUBLE-DIRECTION WAVY HATCHING
+fn run_crosshatch(
+    img: &ImageBuffer<Luma<u8>, Vec<u8>>,
+    settings: &VectorizerSettings,
+    w: u32,
+    h: u32,
+) -> Result<Vec<Toolpath>, String> {
+    let mut toolpaths = run_hatch(img, settings, w, h)?;
+    let spacing = (12.0 / settings.line_density).max(2.0);
+    let mut x = spacing / 2.0;
+
+    while x < w as f32 {
+        let mut path_points = Vec::new();
+        let mut y = 0.0f32;
+        
+        while y < h as f32 {
+            let px = x.min(w as f32 - 1.0) as u32;
+            let py = y.min(h as f32 - 1.0) as u32;
+            let pixel = img.get_pixel(px, py);
+            let darkness = 1.0 - (pixel[0] as f32 / 255.0);
+
+            let amplitude = spacing * 0.8 * darkness;
+            let freq = 0.25;
+            let dx = (y * freq).sin() * amplitude;
+
+            path_points.push(to_physical(x + dx, y, w, h, settings.scale_width, settings.scale_height));
+            
+            y += 1.5;
+        }
+
+        if !path_points.is_empty() {
+            toolpaths.push(Toolpath { points: path_points });
+        }
+        
+        x += spacing;
+    }
+
+    Ok(toolpaths)
 }
 
 #[inline(always)]
