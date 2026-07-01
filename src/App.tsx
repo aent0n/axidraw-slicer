@@ -1399,6 +1399,27 @@ function App() {
       ctx.stroke();
     });
 
+    // Draw simulation cursor in Preview Tab
+    if (activeTab === "preview" && pathsToDraw.length > 0) {
+      const lastPath = pathsToDraw[pathsToDraw.length - 1];
+      if (lastPath.points && lastPath.points.length > 0) {
+        const simPt = lastPath.points[lastPath.points.length - 1];
+        
+        ctx.beginPath();
+        ctx.arc(scaledPadding + simPt.x * scaleX, scaledPadding + simPt.y * scaleY, 7 * dpiScale, 0, 2 * Math.PI);
+        ctx.fillStyle = "rgba(12, 15, 18, 0.9)";
+        ctx.strokeStyle = "rgba(99, 102, 241, 0.95)";
+        ctx.lineWidth = 1.5 * dpiScale;
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(scaledPadding + simPt.x * scaleX, scaledPadding + simPt.y * scaleY, 2 * dpiScale, 0, 2 * Math.PI);
+        ctx.fillStyle = "#ffffff";
+        ctx.fill();
+      }
+    }
+
     // Draw selection borders & Drag/Scale/Rotate handles
     if (activeTab === "prepare" && selectedObjectId) {
       const activeObj = objects.find(o => o.id === selectedObjectId);
