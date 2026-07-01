@@ -2116,11 +2116,8 @@ function App() {
     <div className="app-container">
       <header className="app-header">
         <div className="brand-section">
-          <svg className="brand-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-            <path d="M12 19l7-7 3 3-10 10L2 15l3-3z"/>
-            <path d="M19 12V5a2 2 0 00-2-2H7a2 2 0 00-2 2v7"/>
-          </svg>
-          <span className="brand-title">AXIDRAW SLICER & CONTROL</span>
+          <img src="/logo.png" className="brand-logo" alt="logo" style={{ borderRadius: "4px", objectFit: "contain" }} />
+          <span className="brand-title" style={{ textTransform: "lowercase", letterSpacing: "1px" }}>axidrawslicer</span>
         </div>
         <div className="connection-status">
           <div className="status-indicator">
@@ -2622,6 +2619,12 @@ function App() {
               </div>
             </>
           )}
+
+          {/* Credits footer */}
+          <div style={{ marginTop: "auto", paddingTop: "15px", borderTop: "1px solid var(--border-color)", display: "flex", flexDirection: "column", gap: "2px", alignItems: "center", fontSize: "0.72rem", color: "var(--text-muted)" }}>
+            <span style={{ fontWeight: 600, letterSpacing: "0.5px" }}>axidrawslicer v0.1.0</span>
+            <span>Developed by <strong style={{ color: "var(--accent-color)" }}>aent0n</strong></span>
+          </div>
         </aside>
 
         {/* CENTER VIEWPORT */}
