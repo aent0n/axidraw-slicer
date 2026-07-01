@@ -37,6 +37,9 @@ Un outil de préparation, d'optimisation de tracés vectoriels et de contrôle e
     *   *Arrêt d'urgence intelligent* : Le stylo termine sa course proprement jusqu'au coin (checkpoint) le plus proche avant de se lever et de rentrer à sa base, évitant les sursauts mécaniques ou rayures.
     *   *Pause & Reprise* à la volée.
 
+<img width="2223" height="1392" alt="image" src="https://github.com/user-attachments/assets/bb39032e-66f3-4910-8766-fec2102db75b" />
+
+
 ---
 
 ## Architecture technique
