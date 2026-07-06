@@ -5,6 +5,7 @@ export interface Point {
 
 export interface Toolpath {
   points: Point[];
+  isFill?: boolean;
 }
 
 function parseUnitToMm(valStr: string | null, defaultValue: number): number {
@@ -105,7 +106,61 @@ function parsePathElement(
   }
 }
 
-export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightMm: number = 210): Toolpath[] {
+function generateHatching(polygons: Point[][], spacingMm: number): Toolpath[] {
+  const hatchPaths: Toolpath[] = [];
+  if (polygons.length === 0) return hatchPaths;
+
+  // Get bounding box of all polygons combined
+  let minY = Infinity, maxY = -Infinity;
+  polygons.forEach(poly => {
+    poly.forEach(pt => {
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    });
+  });
+
+  if (minY === Infinity || maxY === Infinity || (maxY - minY) < spacingMm) {
+    return hatchPaths;
+  }
+
+  // Generate horizontal lines across the vertical range of the shape
+  for (let y = minY + spacingMm / 2; y < maxY; y += spacingMm) {
+    const intersections: number[] = [];
+
+    // Find intersections with edges of ALL polygons combined
+    polygons.forEach(poly => {
+      if (poly.length < 3) return;
+      for (let i = 0; i < poly.length; i++) {
+        const p1 = poly[i];
+        const p2 = poly[(i + 1) % poly.length];
+
+        // Check if edge crosses the horizontal line at y
+        if ((p1.y <= y && p2.y > y) || (p2.y <= y && p1.y > y)) {
+          const t = (y - p1.y) / (p2.y - p1.y);
+          const intersectX = p1.x + t * (p2.x - p1.x);
+          intersections.push(intersectX);
+        }
+      }
+    });
+
+    // Sort intersections from left to right
+    intersections.sort((a, b) => a - b);
+
+    // Connect pairs of intersections (Odd-Even fill rule across all sub-paths)
+    for (let i = 0; i < intersections.length - 1; i += 2) {
+      hatchPaths.push({
+        points: [
+          { x: intersections[i], y: y },
+          { x: intersections[i + 1], y: y }
+        ]
+      });
+    }
+  }
+
+  return hatchPaths;
+}
+
+export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightMm: number = 210, svgHatchSpacing: number = 1.0, enableHatching: boolean = false): Toolpath[] {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svgText, "image/svg+xml");
   const svgEl = doc.querySelector("svg");
@@ -156,10 +211,26 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
   drawables.forEach((el) => {
     let dAttr = el.getAttribute("d") || "";
 
+    // Check if the element has a fill color that is not 'none'
+    const fillAttr = el.getAttribute("fill");
+    const styleAttr = el.getAttribute("style") || "";
+    const styleFillMatch = styleAttr.match(/fill\s*:\s*([^;]+)/);
+    const styleFill = styleFillMatch ? styleFillMatch[1].trim() : null;
+    
+    // Check class-based styling computed by the browser
+    const computedStyle = window.getComputedStyle(el);
+    const computedFill = computedStyle ? computedStyle.fill : "";
+    const hasClass = el.getAttribute("class") !== null;
+
+    const finalFill = fillAttr || styleFill;
+    const hasFill = (finalFill !== null && finalFill !== "none") ||
+                    (hasClass && computedFill !== "none" && computedFill !== "");
+
     if (el.tagName.toLowerCase() === "path") {
       // Split the path data by 'M' or 'm' commands using positive lookahead
       const subPathDatas = dAttr.split(/(?=[Mm])/).map(s => s.trim()).filter(s => s.length > 0);
       
+      const elementPaths: Toolpath[] = [];
       subPathDatas.forEach((subD) => {
         const subPathEl = document.createElementNS("http://www.w3.org/2000/svg", "path");
         subPathEl.setAttribute("d", subD);
@@ -174,11 +245,20 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
         // Append temporarily to measure
         tempSvg.appendChild(subPathEl);
         
-        parsePathElement(subPathEl, tempSvg, scaleX, scaleY, resolution, paths);
+        parsePathElement(subPathEl, tempSvg, scaleX, scaleY, resolution, elementPaths);
         
         // Cleanup
         tempSvg.removeChild(subPathEl);
       });
+
+      paths.push(...elementPaths);
+
+      if (enableHatching && hasFill && elementPaths.length > 0) {
+        const polygons = elementPaths.map(ep => ep.points);
+        const hatches = generateHatching(polygons, svgHatchSpacing);
+        hatches.forEach(h => h.isFill = true);
+        paths.push(...hatches);
+      }
     } else {
       // Convert other shapes to path data
       try {
@@ -190,8 +270,18 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
           if (transform) newPath.setAttribute("transform", transform);
           
           tempSvg.appendChild(newPath);
-          parsePathElement(newPath, tempSvg, scaleX, scaleY, resolution, paths);
+          const elementPaths: Toolpath[] = [];
+          parsePathElement(newPath, tempSvg, scaleX, scaleY, resolution, elementPaths);
           tempSvg.removeChild(newPath);
+
+          paths.push(...elementPaths);
+
+          if (enableHatching && hasFill && elementPaths.length > 0) {
+            const polygons = elementPaths.map(ep => ep.points);
+            const hatches = generateHatching(polygons, svgHatchSpacing);
+            hatches.forEach(h => h.isFill = true);
+            paths.push(...hatches);
+          }
         }
       } catch (err) {
         console.error("Failed to convert shape to path:", el, err);

@@ -10,6 +10,7 @@ interface Point {
 
 interface Toolpath {
   points: Point[];
+  isFill?: boolean;
 }
 
 interface ProgressPayload {
@@ -61,6 +62,7 @@ interface SlicerObject {
   offsetY: number;
   scale: number;
   rotation: number;
+  svgText?: string;
 }
 
 const formatTime = (secs: number): string => {
@@ -114,6 +116,26 @@ function App() {
   const [zoom, setZoom] = useState(1.0); // Canvas Zoom level
   const [bedPreset, setBedPreset] = useState("A4");
 
+  // Background Visual Template Image States
+  const [templateImage, setTemplateImage] = useState<HTMLImageElement | null>(null);
+  const [templateOpacity, setTemplateOpacity] = useState<number>(50);
+  const [templateScale, setTemplateScale] = useState<number>(100);
+  const [templateOffsetX, setTemplateOffsetX] = useState<number>(0);
+  const [templateOffsetY, setTemplateOffsetY] = useState<number>(0);
+  const [templateRotation, setTemplateRotation] = useState<number>(0);
+  const [isTemplateLocked, setIsTemplateLocked] = useState<boolean>(false);
+
+  // Priming Line States
+  const [enablePrimingLine, setEnablePrimingLine] = useState<boolean>(false);
+  const [primingStartX, setPrimingStartX] = useState<number>(10);
+  const [primingStartY, setPrimingStartY] = useState<number>(10);
+  const [primingLength, setPrimingLength] = useState<number>(30);
+  const [primingDirection, setPrimingDirection] = useState<"horizontal" | "vertical">("vertical");
+
+  // SVG Fill settings
+  const [svgHatchSpacing, setSvgHatchSpacing] = useState<number>(1.0); // mm
+  const [enableSvgHatching, setEnableSvgHatching] = useState<boolean>(false);
+
   // Slicer Multi-Object State & Selection Grouping
   const [objects, setObjects] = useState<SlicerObject[]>([]);
   const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
@@ -140,6 +162,7 @@ function App() {
   const [slicingStats, setSlicingStats] = useState<SlicingStats | null>(null);
   const [simulatedPointsCount, setSimulatedPointsCount] = useState<number | null>(null);
   const [slicedPaths, setSlicedPaths] = useState<Toolpath[]>([]); // NN-optimized paths
+  const [rawSlicedPaths, setRawSlicedPaths] = useState<Toolpath[]>([]); // Sliced paths without priming line
 
   // Pen Profiles Manager
   const [penProfiles, setPenProfiles] = useState<PenProfile[]>(() => {
@@ -253,6 +276,12 @@ function App() {
   // Refs to avoid stale closures in event listeners
   const slicingStatsRef = useRef(slicingStats);
   useEffect(() => { slicingStatsRef.current = slicingStats; }, [slicingStats]);
+
+  const enableSvgHatchingRef = useRef(enableSvgHatching);
+  useEffect(() => { enableSvgHatchingRef.current = enableSvgHatching; }, [enableSvgHatching]);
+
+  const svgHatchSpacingRef = useRef(svgHatchSpacing);
+  useEffect(() => { svgHatchSpacingRef.current = svgHatchSpacing; }, [svgHatchSpacing]);
 
   const jobStartTimeRef = useRef(jobStartTime);
   useEffect(() => { jobStartTimeRef.current = jobStartTime; }, [jobStartTime]);
@@ -374,6 +403,41 @@ function App() {
     };
   };
 
+  const getCombinedObjectsBounds = () => {
+    if (objects.length === 0) return null;
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    objects.forEach(obj => {
+      const bounds = getObjectBounds(obj);
+      if (bounds) {
+        if (bounds.minX < minX) minX = bounds.minX;
+        if (bounds.maxX > maxX) maxX = bounds.maxX;
+        if (bounds.minY < minY) minY = bounds.minY;
+        if (bounds.maxY > maxY) maxY = bounds.maxY;
+      }
+    });
+    if (minX === Infinity || minY === Infinity) return null;
+    return { minX, maxX, minY, maxY };
+  };
+
+  const getTemplateBounds = () => {
+    if (!templateImage) return null;
+    const imgW = templateImage.naturalWidth;
+    const imgH = templateImage.naturalHeight;
+    const aspect = imgH / imgW;
+    const physicalW = scaleWidth * (templateScale / 100);
+    const physicalH = (scaleWidth * aspect) * (templateScale / 100);
+
+    return {
+      minX: templateOffsetX,
+      maxX: templateOffsetX + physicalW,
+      minY: templateOffsetY,
+      maxY: templateOffsetY + physicalH,
+      width: physicalW,
+      height: physicalH
+    };
+  };
+
   // Ramer-Douglas-Peucker (RDP) path simplification helpers to prevent EBB stepper motors from slipping due to chatter at high speed
   const getSqSegDist = (p: Point, p1: Point, p2: Point) => {
     let x = p1.x;
@@ -482,7 +546,10 @@ function App() {
 
         // Apply Ramer-Douglas-Peucker simplification with 0.04mm tolerance (invisible, but huge EBB speed stability gain)
         const simplifiedPoints = simplifyRDP(points, 0.04);
-        return { points: simplifiedPoints };
+        return { 
+          points: simplifiedPoints,
+          isFill: path.isFill
+        };
       });
 
       allPaths.push(...processedObjPaths);
@@ -521,17 +588,15 @@ function App() {
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const processFile = (file: File) => {
     const reader = new FileReader();
-    if (file.name.endsWith(".svg")) {
+    const fileNameLower = file.name.toLowerCase();
+    if (fileNameLower.endsWith(".svg")) {
       setFileType("svg");
       reader.onload = (event) => {
         const svgText = event.target?.result as string;
         try {
-          const parsed = parseSVG(svgText, scaleWidth, scaleHeight);
+          const parsed = parseSVG(svgText, scaleWidth, scaleHeight, svgHatchSpacing, enableSvgHatching);
           
           // Resolve duplicate name
           let finalName = file.name;
@@ -552,7 +617,8 @@ function App() {
             offsetX: 0,
             offsetY: 0,
             scale: 100,
-            rotation: 0
+            rotation: 0,
+            svgText: svgText
           };
           setObjects(prev => [...prev, newObj]);
           setSelectedObjectIds([newObj.id]);
@@ -575,9 +641,43 @@ function App() {
       };
       reader.readAsArrayBuffer(file);
     }
-    
-    // Clear input value to allow selecting same file again
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) processFile(file);
     e.target.value = "";
+  };
+
+  const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (file) processFile(file);
+  };
+
+  const processTemplateFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        setTemplateImage(img);
+        setStatusMsg("Background template loaded successfully!");
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleTemplateUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) processTemplateFile(file);
+    e.target.value = "";
+  };
+
+  const handleTemplateDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (file) processTemplateFile(file);
   };
 
   const handleGenerateToolpath = async () => {
@@ -704,6 +804,15 @@ function App() {
 
   const rotate90 = (direction: "left" | "right") => {
     if (activeTab === "preview") return;
+    if (selectedObjectIds.includes("template-object")) {
+      setTemplateRotation(prev => {
+        let newRot = prev + (direction === "right" ? 90 : -90);
+        if (newRot < 0) newRot += 360;
+        if (newRot >= 360) newRot -= 360;
+        return newRot;
+      });
+      return;
+    }
     if (selectedObjectIds.length === 0) return;
     setObjects(prev => prev.map(obj => {
       if (selectedObjectIds.includes(obj.id)) {
@@ -861,50 +970,164 @@ function App() {
 
     setStatusMsg("Slicing and optimizing toolpath...");
     
-    const unvisited = [...combinedPaths];
-    const optimizedPaths: Toolpath[] = [];
-    
-    let currPos: Point = { x: 0, y: 0 };
+    // Separate fills and outlines
+    const fillPaths = combinedPaths.filter(p => p.isFill);
+    const outlinePaths = combinedPaths.filter(p => !p.isFill);
 
-    while (unvisited.length > 0) {
-      let minDistance = Infinity;
-      let bestIdx = 0;
-      let shouldReverse = false;
+    const optimizePathsNN = (paths: Toolpath[], startPoint: Point): { optimized: Toolpath[], endPoint: Point } => {
+      const unvisited = [...paths];
+      const optimized: Toolpath[] = [];
+      let currPos = { ...startPoint };
 
-      for (let i = 0; i < unvisited.length; i++) {
-        const path = unvisited[i];
-        if (path.points.length === 0) continue;
+      while (unvisited.length > 0) {
+        let minSqDist = Infinity;
+        let bestIdx = 0;
+        let shouldReverse = false;
+
+        for (let i = 0; i < unvisited.length; i++) {
+          const path = unvisited[i];
+          if (path.points.length === 0) continue;
+          const startPt = path.points[0];
+          const endPt = path.points[path.points.length - 1];
+          
+          const dxStart = startPt.x - currPos.x;
+          const dyStart = startPt.y - currPos.y;
+          const dStartSq = dxStart * dxStart + dyStart * dyStart;
+
+          const dxEnd = endPt.x - currPos.x;
+          const dyEnd = endPt.y - currPos.y;
+          const dEndSq = dxEnd * dxEnd + dyEnd * dyEnd;
+
+          if (dStartSq < minSqDist) {
+            minSqDist = dStartSq;
+            bestIdx = i;
+            shouldReverse = false;
+          }
+          if (dEndSq < minSqDist) {
+            minSqDist = dEndSq;
+            bestIdx = i;
+            shouldReverse = true;
+          }
+        }
+
+        const nextPath = unvisited[bestIdx];
+        // Swap with last and pop for O(1) removal
+        unvisited[bestIdx] = unvisited[unvisited.length - 1];
+        unvisited.pop();
+
+        if (shouldReverse) {
+          nextPath.points.reverse();
+        }
         
-        const startPt = path.points[0];
-        const endPt = path.points[path.points.length - 1];
-
-        const dStart = Math.hypot(startPt.x - currPos.x, startPt.y - currPos.y);
-        const dEnd = Math.hypot(endPt.x - currPos.x, endPt.y - currPos.y);
-
-        if (dStart < minDistance) {
-          minDistance = dStart;
-          bestIdx = i;
-          shouldReverse = false;
-        }
-        if (dEnd < minDistance) {
-          minDistance = dEnd;
-          bestIdx = i;
-          shouldReverse = true;
-        }
+        currPos = nextPath.points[nextPath.points.length - 1];
+        optimized.push(nextPath);
       }
 
-      const nextPath = unvisited.splice(bestIdx, 1)[0];
-      if (shouldReverse) {
-        nextPath.points.reverse();
+      return { optimized, endPoint: currPos };
+    };
+
+    // Optimize fills first, starting from origin (0, 0)
+    const fillsResult = optimizePathsNN(fillPaths, { x: 0, y: 0 });
+
+    // Optimize outlines second, starting from where the fills ended
+    const outlinesResult = optimizePathsNN(outlinePaths, fillsResult.endPoint);
+
+    const optimizedPaths = [...fillsResult.optimized, ...outlinesResult.optimized];
+
+    setRawSlicedPaths(optimizedPaths);
+
+    // Auto-position the priming line relative to new sliced design boundaries
+    const bounds = getCombinedObjectsBounds();
+    if (bounds) {
+      if (primingDirection === "vertical") {
+        let targetX = bounds.minX - 8;
+        if (targetX < margin) {
+          targetX = bounds.maxX + 8;
+          if (targetX > scaleWidth - margin) {
+            targetX = margin;
+          }
+        }
+        let targetY = bounds.minY;
+        if (targetY < margin) targetY = margin;
+        if (targetY + primingLength > scaleHeight - margin) {
+          targetY = Math.max(margin, scaleHeight - margin - primingLength);
+        }
+        setPrimingStartX(parseFloat(targetX.toFixed(1)));
+        setPrimingStartY(parseFloat(targetY.toFixed(1)));
+      } else {
+        let targetY = bounds.maxY + 8;
+        if (targetY > scaleHeight - margin) {
+          targetY = bounds.minY - 8;
+          if (targetY < margin) {
+            targetY = margin;
+          }
+        }
+        let targetX = bounds.minX;
+        if (targetX < margin) targetX = margin;
+        if (targetX + primingLength > scaleWidth - margin) {
+          targetX = Math.max(margin, scaleWidth - margin - primingLength);
+        }
+        setPrimingStartX(parseFloat(targetX.toFixed(1)));
+        setPrimingStartY(parseFloat(targetY.toFixed(1)));
       }
-      
-      currPos = nextPath.points[nextPath.points.length - 1];
-      optimizedPaths.push(nextPath);
     }
 
-    setSlicedPaths(optimizedPaths);
     setActiveTab("preview");
     setStatusMsg("Toolpath sliced and optimized successfully!");
+  };
+
+  const handleAutoPositionPriming = () => {
+    const bounds = getCombinedObjectsBounds();
+    if (!bounds) {
+      setStatusMsg("No designs loaded on the bed to align priming line.");
+      return;
+    }
+
+    if (primingDirection === "vertical") {
+      // Try to place to the left first
+      let targetX = bounds.minX - 8;
+      if (targetX < margin) {
+        // If not enough space on the left, place to the right
+        targetX = bounds.maxX + 8;
+        if (targetX > scaleWidth - margin) {
+          // If no space on right either, default to margin
+          targetX = margin;
+        }
+      }
+      
+      // Align Y with the top of the design boundary, clamping it to fit the length
+      let targetY = bounds.minY;
+      if (targetY < margin) targetY = margin;
+      if (targetY + primingLength > scaleHeight - margin) {
+        targetY = Math.max(margin, scaleHeight - margin - primingLength);
+      }
+      
+      setPrimingStartX(parseFloat(targetX.toFixed(1)));
+      setPrimingStartY(parseFloat(targetY.toFixed(1)));
+      setStatusMsg(`Aligned vertical priming line near design bounds: X=${targetX.toFixed(1)}mm`);
+    } else {
+      // Try to place below the design first
+      let targetY = bounds.maxY + 8;
+      if (targetY > scaleHeight - margin) {
+        // If not enough space below, place above
+        targetY = bounds.minY - 8;
+        if (targetY < margin) {
+          // If no space above either, default to margin
+          targetY = margin;
+        }
+      }
+      
+      // Align X with the left of the design boundary, clamping it to fit the length
+      let targetX = bounds.minX;
+      if (targetX < margin) targetX = margin;
+      if (targetX + primingLength > scaleWidth - margin) {
+        targetX = Math.max(margin, scaleWidth - margin - primingLength);
+      }
+      
+      setPrimingStartX(parseFloat(targetX.toFixed(1)));
+      setPrimingStartY(parseFloat(targetY.toFixed(1)));
+      setStatusMsg(`Aligned horizontal priming line near design bounds: Y=${targetY.toFixed(1)}mm`);
+    }
   };
 
   const handleConsoleResizeMouseDown = (e: React.MouseEvent) => {
@@ -1044,15 +1267,33 @@ function App() {
 
   // Sync input text states when selected object changes
   useEffect(() => {
-    const selected = objects.find(o => o.id === selectedObjectId);
-    if (selected) {
-      setInputScaleText(selected.scale.toString());
-      setInputRotationText(selected.rotation.toString());
+    if (selectedObjectId === "template-object") {
+      setInputScaleText(templateScale.toString());
+      setInputRotationText(templateRotation.toString());
     } else {
-      setInputScaleText("");
-      setInputRotationText("");
+      const selected = objects.find(o => o.id === selectedObjectId);
+      if (selected) {
+        setInputScaleText(selected.scale.toString());
+        setInputRotationText(selected.rotation.toString());
+      } else {
+        setInputScaleText("");
+        setInputRotationText("");
+      }
     }
-  }, [selectedObjectId, objects]);
+  }, [selectedObjectId, objects, templateScale, templateRotation]);
+
+  // Prevent default drag-and-drop behavior globally to avoid window navigation
+  useEffect(() => {
+    const preventDefault = (e: DragEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("dragover", preventDefault);
+    window.addEventListener("drop", preventDefault);
+    return () => {
+      window.removeEventListener("dragover", preventDefault);
+      window.removeEventListener("drop", preventDefault);
+    };
+  }, []);
 
   // Keyboard Shortcuts Hook
   useEffect(() => {
@@ -1078,10 +1319,16 @@ function App() {
       } else if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedObjectIds.length > 0) {
           e.preventDefault();
-          setObjects(prev => prev.filter(o => !selectedObjectIds.includes(o.id)));
-          setSelectedObjectIds([]);
-          setSlicingStats(null);
-          setStatusMsg("Deleted selected objects");
+          if (selectedObjectIds.includes("template-object")) {
+            setTemplateImage(null);
+            setSelectedObjectIds([]);
+            setStatusMsg("Template removed");
+          } else {
+            setObjects(prev => prev.filter(o => !selectedObjectIds.includes(o.id)));
+            setSelectedObjectIds([]);
+            setSlicingStats(null);
+            setStatusMsg("Deleted selected objects");
+          }
         }
       }
     };
@@ -1278,7 +1525,7 @@ function App() {
     listen<string>("inkscape-import", (event) => {
       const svgText = event.payload;
       try {
-        const parsed = parseSVG(svgText, scaleWidthRef.current, scaleHeightRef.current);
+        const parsed = parseSVG(svgText, scaleWidthRef.current, scaleHeightRef.current, svgHatchSpacingRef.current, enableSvgHatchingRef.current);
         setObjects((prev) => {
           const newObj: SlicerObject = {
             id: `obj-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -1287,7 +1534,8 @@ function App() {
             offsetX: 0,
             offsetY: 0,
             scale: 100,
-            rotation: 0
+            rotation: 0,
+            svgText: svgText
           };
           setTimeout(() => setSelectedObjectIds([newObj.id]), 0);
           return [...prev, newObj];
@@ -1317,7 +1565,32 @@ function App() {
 
   useEffect(() => {
     renderCanvas();
-  }, [objects, progress, scaleWidth, scaleHeight, margin, selectedObjectIds, activeTab, simulatedPointsCount, originCorner, currentPos, invertX, invertY, zoom, connected]);
+  }, [
+    objects, progress, scaleWidth, scaleHeight, margin, selectedObjectIds, activeTab,
+    simulatedPointsCount, originCorner, currentPos, invertX, invertY, zoom, connected,
+    templateImage, templateOpacity, templateScale, templateOffsetX, templateOffsetY, templateRotation, isTemplateLocked,
+    enablePrimingLine, primingStartX, primingStartY, primingLength, primingDirection, slicedPaths
+  ]);
+
+  // Re-parse SVGs when hatch spacing or enableSvgHatching changes
+  useEffect(() => {
+    setObjects(prev => prev.map(obj => {
+      if (obj.svgText) {
+        try {
+          const parsed = parseSVG(obj.svgText, scaleWidth, scaleHeight, svgHatchSpacing, enableSvgHatching);
+          return {
+            ...obj,
+            rawPaths: parsed
+          };
+        } catch (err) {
+          console.error("Failed to re-parse SVG:", err);
+        }
+      }
+      return obj;
+    }));
+    setSlicingStats(null);
+    setSlicedPaths([]);
+  }, [svgHatchSpacing, enableSvgHatching, scaleWidth, scaleHeight]);
 
   // Redirect to Prepare tab if plotter disconnects while in Monitor tab
   useEffect(() => {
@@ -1326,6 +1599,28 @@ function App() {
       setStatusMsg("Disconnected: Monitor tab closed");
     }
   }, [connected, activeTab]);
+
+  // Instant priming line update effect to prevent UI freeze
+  useEffect(() => {
+    if (rawSlicedPaths.length === 0) {
+      setSlicedPaths([]);
+      return;
+    }
+    if (enablePrimingLine) {
+      const endX = primingDirection === "horizontal" ? (primingStartX + primingLength) : primingStartX;
+      const endY = primingDirection === "vertical" ? (primingStartY + primingLength) : primingStartY;
+      
+      const primingPath: Toolpath = {
+        points: [
+          { x: primingStartX, y: primingStartY },
+          { x: endX, y: endY }
+        ]
+      };
+      setSlicedPaths([primingPath, ...rawSlicedPaths]);
+    } else {
+      setSlicedPaths(rawSlicedPaths);
+    }
+  }, [rawSlicedPaths, enablePrimingLine, primingStartX, primingStartY, primingLength, primingDirection]);
 
   // Draw on monitor canvas (live print dashboard visualizer - Fluidd style)
   useEffect(() => {
@@ -1348,6 +1643,28 @@ function App() {
 
     const mScaleX = mWidth / scaleWidth;
     const mScaleY = mHeight / scaleHeight;
+
+    // Draw background template image if loaded
+    if (templateImage) {
+      ctx.save();
+      ctx.globalAlpha = templateOpacity / 100;
+      const bounds = getTemplateBounds();
+      if (bounds) {
+        const cx = bounds.minX + bounds.width / 2;
+        const cy = bounds.minY + bounds.height / 2;
+
+        ctx.translate(cx * mScaleX, cy * mScaleY);
+        ctx.rotate((templateRotation * Math.PI) / 180);
+        ctx.drawImage(
+          templateImage, 
+          -bounds.width / 2 * mScaleX, 
+          -bounds.height / 2 * mScaleY, 
+          bounds.width * mScaleX, 
+          bounds.height * mScaleY
+        );
+      }
+      ctx.restore();
+    }
 
     const processed = slicedPaths.length > 0 ? slicedPaths : getProcessedToolpaths();
 
@@ -1437,7 +1754,7 @@ function App() {
     ctx.strokeStyle = "#ef4444";
     ctx.lineWidth = 1.0;
     ctx.stroke();
-  }, [progress, currentPos, scaleWidth, scaleHeight, activeTab, objects, showFuturePath, invertX, invertY, slicedPaths, monitorZoom, connected]);
+  }, [progress, currentPos, scaleWidth, scaleHeight, activeTab, objects, showFuturePath, invertX, invertY, slicedPaths, monitorZoom, connected, templateImage, templateOpacity, templateScale, templateOffsetX, templateOffsetY, templateRotation]);
 
   // Update pen heights on EBB dynamically when connected
   useEffect(() => {
@@ -1503,6 +1820,28 @@ function App() {
     ctx.lineWidth = 1 * dpiScale;
     ctx.strokeRect(scaledPadding, scaledPadding, canvas.width - scaledPadding * 2, canvas.height - scaledPadding * 2);
 
+    // Draw background template image if loaded
+    if (templateImage) {
+      ctx.save();
+      ctx.globalAlpha = templateOpacity / 100;
+      const bounds = getTemplateBounds();
+      if (bounds) {
+        const cx = bounds.minX + bounds.width / 2;
+        const cy = bounds.minY + bounds.height / 2;
+
+        ctx.translate(scaledPadding + cx * scaleX, scaledPadding + cy * scaleY);
+        ctx.rotate((templateRotation * Math.PI) / 180);
+        ctx.drawImage(
+          templateImage, 
+          -bounds.width / 2 * scaleX, 
+          -bounds.height / 2 * scaleY, 
+          bounds.width * scaleX, 
+          bounds.height * scaleY
+        );
+      }
+      ctx.restore();
+    }
+
     // Draw grid marks (every 50mm) inside the bed boundaries
     ctx.strokeStyle = "rgba(0, 0, 0, 0.04)";
     ctx.lineWidth = 1 * dpiScale;
@@ -1517,6 +1856,30 @@ function App() {
       ctx.moveTo(scaledPadding, scaledPadding + gy * scaleY);
       ctx.lineTo(canvas.width - scaledPadding, scaledPadding + gy * scaleY);
       ctx.stroke();
+    }
+
+    // Draw Priming Line guide if enabled
+    if (enablePrimingLine) {
+      const endX = primingDirection === "horizontal" ? (primingStartX + primingLength) : primingStartX;
+      const endY = primingDirection === "vertical" ? (primingStartY + primingLength) : primingStartY;
+      
+      ctx.beginPath();
+      ctx.moveTo(scaledPadding + primingStartX * scaleX, scaledPadding + primingStartY * scaleY);
+      ctx.lineTo(scaledPadding + endX * scaleX, scaledPadding + endY * scaleY);
+      ctx.strokeStyle = "rgba(16, 185, 129, 0.65)"; // Greenish color
+      ctx.lineWidth = 2 * dpiScale;
+      ctx.setLineDash([4 * dpiScale, 3 * dpiScale]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      
+      // Small label next to it
+      ctx.fillStyle = "rgba(16, 185, 129, 0.9)";
+      ctx.font = `bold ${8 * dpiScale}px sans-serif`;
+      ctx.fillText(
+        "PRIMING LINE", 
+        scaledPadding + (Math.max(primingStartX, endX) + 4) * scaleX, 
+        scaledPadding + (Math.min(primingStartY, endY) + 6) * scaleY
+      );
     }
 
     // Safety margin box inside bed boundaries
@@ -1691,6 +2054,48 @@ function App() {
       }
     }
 
+    // Draw selection outline and handles for template image when selected and not locked
+    if ((activeTab === "prepare" || activeTab === "preview") && selectedObjectId === "template-object" && !isTemplateLocked) {
+      const bounds = getTemplateBounds();
+      if (bounds) {
+        ctx.strokeStyle = "var(--accent-color)";
+        ctx.lineWidth = 2; 
+        ctx.setLineDash([10, 6]);
+        
+        ctx.save();
+        const cx = bounds.minX + bounds.width / 2;
+        const cy = bounds.minY + bounds.height / 2;
+        ctx.translate(scaledPadding + cx * scaleX, scaledPadding + cy * scaleY);
+        ctx.rotate((templateRotation * Math.PI) / 180);
+        
+        // Draw rectangle boundary
+        ctx.strokeRect(-bounds.width / 2 * scaleX, -bounds.height / 2 * scaleY, bounds.width * scaleX, bounds.height * scaleY);
+        ctx.setLineDash([]);
+        
+        if (activeTab === "prepare") {
+          // Corner Scale Handle (bottom right)
+          ctx.fillStyle = "#ffffff";
+          ctx.strokeStyle = "var(--accent-color)";
+          ctx.lineWidth = 3;
+          ctx.fillRect(bounds.width / 2 * scaleX - 6, bounds.height / 2 * scaleY - 6, 12, 12);
+          ctx.strokeRect(bounds.width / 2 * scaleX - 6, bounds.height / 2 * scaleY - 6, 12, 12);
+
+          // Rotate Handle (top middle extended)
+          const rotY = -bounds.height / 2 - 15 / scaleY;
+          ctx.beginPath();
+          ctx.moveTo(0, -bounds.height / 2 * scaleY);
+          ctx.lineTo(0, rotY * scaleY);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(0, rotY * scaleY, 8, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+
     // Draw Home Origin Target Indicator (permanent CAD-style crosshair visual aid)
     if (activeTab === "prepare") {
       const homeX = invertX ? scaleWidth : 0;
@@ -1828,6 +2233,43 @@ function App() {
       }
     }
 
+    // Check handles of template image if selected and not locked
+    if (selectedObjectId === "template-object" && !isTemplateLocked) {
+      const bounds = getTemplateBounds();
+      if (bounds) {
+        const cx = bounds.minX + bounds.width / 2;
+        const cy = bounds.minY + bounds.height / 2;
+        const rad = (templateRotation * Math.PI) / 180;
+        
+        const dx = mmX - cx;
+        const dy = mmY - cy;
+        const localX = dx * Math.cos(-rad) - dy * Math.sin(-rad);
+        const localY = dx * Math.sin(-rad) + dy * Math.cos(-rad);
+
+        const canvasScaleX = (canvas.width - CANVAS_PADDING * 2) / 2 / scaleWidth;
+        const canvasScaleY = (canvas.height - CANVAS_PADDING * 2) / 2 / scaleHeight;
+        const handleSizeMm = 8 / ((canvasScaleX + canvasScaleY) / 2);
+
+        // Scale handle (bottom right)
+        const distToScale = Math.hypot(localX - bounds.width / 2, localY - bounds.height / 2);
+        if (distToScale <= handleSizeMm * 1.5) {
+          setDragMode("scale");
+          setIsDragging(true);
+          setDragStart({ x: mmX, y: mmY, initOffsetX: templateScale, initOffsetY: 0 });
+          return;
+        }
+
+        // Rotate handle (top middle)
+        const distToRotate = Math.hypot(localX, localY - (-bounds.height / 2 - 15));
+        if (distToRotate <= handleSizeMm * 1.5) {
+          setDragMode("rotate");
+          setIsDragging(true);
+          setDragStart({ x: mmX, y: mmY, initOffsetX: templateRotation, initOffsetY: 0 });
+          return;
+        }
+      }
+    }
+
     // Default translation click (supports clicking any item in the selection group)
     let clickedObjId: string | null = null;
     let clickedStart = { x: 0, y: 0, initOffsetX: 0, initOffsetY: 0 };
@@ -1845,25 +2287,51 @@ function App() {
       }
     }
 
-    if (clickedObjId) {
-      // If clicked item is not already in the selection, make it the single selection.
-      // But if it is already in the selection, preserve the selection group!
-      if (!selectedObjectIds.includes(clickedObjId)) {
-        setSelectedObjectIds([clickedObjId]);
-      }
-      
-      setDragMode("translate");
-      setIsDragging(true);
-      setDragStart(clickedStart);
+    if (!clickedObjId && templateImage && !isTemplateLocked) {
+      const bounds = getTemplateBounds();
+      if (bounds) {
+        const cx = bounds.minX + bounds.width / 2;
+        const cy = bounds.minY + bounds.height / 2;
+        const rad = (templateRotation * Math.PI) / 180;
+        
+        const dx = mmX - cx;
+        const dy = mmY - cy;
+        const localX = dx * Math.cos(-rad) - dy * Math.sin(-rad);
+        const localY = dx * Math.sin(-rad) + dy * Math.cos(-rad);
 
-      // Record start offsets for all selected objects for smooth translation grouping
-      const startOffsets: { [id: string]: { x: number, y: number } } = {};
-      objects.forEach(o => {
-        if (selectedObjectIds.includes(o.id) || o.id === clickedObjId) {
-          startOffsets[o.id] = { x: o.offsetX, y: o.offsetY };
+        if (localX >= -bounds.width / 2 && localX <= bounds.width / 2 && localY >= -bounds.height / 2 && localY <= bounds.height / 2) {
+          clickedObjId = "template-object";
+          clickedStart = { x: mmX, y: mmY, initOffsetX: templateOffsetX, initOffsetY: templateOffsetY };
         }
-      });
-      setDragStartOffsets(startOffsets);
+      }
+    }
+
+    if (clickedObjId) {
+      if (clickedObjId === "template-object") {
+        setSelectedObjectIds(["template-object"]);
+        setDragMode("translate");
+        setIsDragging(true);
+        setDragStart(clickedStart);
+      } else {
+        // If clicked item is not already in the selection, make it the single selection.
+        // But if it is already in the selection, preserve the selection group!
+        if (!selectedObjectIds.includes(clickedObjId)) {
+          setSelectedObjectIds([clickedObjId]);
+        }
+        
+        setDragMode("translate");
+        setIsDragging(true);
+        setDragStart(clickedStart);
+
+        // Record start offsets for all selected objects for smooth translation grouping
+        const startOffsets: { [id: string]: { x: number, y: number } } = {};
+        objects.forEach(o => {
+          if (selectedObjectIds.includes(o.id) || o.id === clickedObjId) {
+            startOffsets[o.id] = { x: o.offsetX, y: o.offsetY };
+          }
+        });
+        setDragStartOffsets(startOffsets);
+      }
     } else {
       setSelectedObjectIds([]);
       setDragMode(null);
@@ -1883,6 +2351,40 @@ function App() {
     const mmY = ((clientY - CANVAS_PADDING) / (rect.height - CANVAS_PADDING * 2)) * scaleHeight;
 
     if (isDragging && selectedObjectId) {
+      if (selectedObjectId === "template-object") {
+        const bounds = getTemplateBounds();
+        if (bounds) {
+          if (dragMode === "translate") {
+            const dx = mmX - dragStart.x;
+            const dy = mmY - dragStart.y;
+            setTemplateOffsetX(dragStart.initOffsetX + dx);
+            setTemplateOffsetY(dragStart.initOffsetY + dy);
+          } else if (dragMode === "scale") {
+            const cx = bounds.minX + bounds.width / 2;
+            const cy = bounds.minY + bounds.height / 2;
+            const currentDist = Math.hypot(mmX - cx, mmY - cy);
+            
+            const imgW = templateImage!.naturalWidth;
+            const imgH = templateImage!.naturalHeight;
+            const aspect = imgH / imgW;
+            const diag100 = Math.hypot(scaleWidth / 2, (scaleWidth * aspect) / 2);
+            
+            let newScale = Math.round((currentDist / diag100) * 100);
+            newScale = Math.max(10, Math.min(300, newScale));
+            setTemplateScale(newScale);
+          } else if (dragMode === "rotate") {
+            const cx = bounds.minX + bounds.width / 2;
+            const cy = bounds.minY + bounds.height / 2;
+
+            const rad = Math.atan2(mmX - cx, cy - mmY);
+            let deg = Math.round((rad * 180) / Math.PI);
+            if (deg < 0) deg += 360;
+            setTemplateRotation(deg);
+          }
+        }
+        return;
+      }
+
       const obj = objects.find(o => o.id === selectedObjectId);
       if (!obj) return;
 
@@ -1950,7 +2452,31 @@ function App() {
     } else {
       let hoveredMode: "translate" | "scale" | "rotate" | null = null;
       
-      if (selectedObjectId) {
+      if (selectedObjectId === "template-object" && !isTemplateLocked) {
+        const bounds = getTemplateBounds();
+        if (bounds) {
+          const cx = bounds.minX + bounds.width / 2;
+          const cy = bounds.minY + bounds.height / 2;
+          const rad = (templateRotation * Math.PI) / 180;
+          
+          const dx = mmX - cx;
+          const dy = mmY - cy;
+          const localX = dx * Math.cos(-rad) - dy * Math.sin(-rad);
+          const localY = dx * Math.sin(-rad) + dy * Math.cos(-rad);
+
+          const canvasScaleX = (canvas.width - CANVAS_PADDING * 2) / 2 / scaleWidth;
+          const canvasScaleY = (canvas.height - CANVAS_PADDING * 2) / 2 / scaleHeight;
+          const handleSizeMm = 8 / ((canvasScaleX + canvasScaleY) / 2);
+
+          if (Math.hypot(localX - bounds.width / 2, localY - bounds.height / 2) <= handleSizeMm * 1.5) {
+            hoveredMode = "scale";
+          } else if (Math.hypot(localX, localY - (-bounds.height / 2 - 15)) <= handleSizeMm * 1.5) {
+            hoveredMode = "rotate";
+          } else if (localX >= -bounds.width / 2 && localX <= bounds.width / 2 && localY >= -bounds.height / 2 && localY <= bounds.height / 2) {
+            hoveredMode = "translate";
+          }
+        }
+      } else if (selectedObjectId) {
         const obj = objects.find(o => o.id === selectedObjectId);
         if (obj) {
           const bounds = getObjectBounds(obj);
@@ -1976,6 +2502,24 @@ function App() {
           if (mmX >= bounds.minX - padding && mmX <= bounds.maxX + padding && mmY >= bounds.minY - padding && mmY <= bounds.maxY + padding) {
             hoveredMode = "translate";
             break;
+          }
+        }
+
+        if (!hoveredMode && templateImage && !isTemplateLocked) {
+          const bounds = getTemplateBounds();
+          if (bounds) {
+            const cx = bounds.minX + bounds.width / 2;
+            const cy = bounds.minY + bounds.height / 2;
+            const rad = (templateRotation * Math.PI) / 180;
+            
+            const dx = mmX - cx;
+            const dy = mmY - cy;
+            const localX = dx * Math.cos(-rad) - dy * Math.sin(-rad);
+            const localY = dx * Math.sin(-rad) + dy * Math.cos(-rad);
+
+            if (localX >= -bounds.width / 2 && localX <= bounds.width / 2 && localY >= -bounds.height / 2 && localY <= bounds.height / 2) {
+              hoveredMode = "translate";
+            }
           }
         }
       }
@@ -2327,10 +2871,12 @@ function App() {
       case "center":
         setStatusMsg("Homing plotter to origin...");
         try {
+          // Raise pen first to prevent dragging across the sheet
+          await invoke("toggle_pen", { down: false, durationMs: penDelay });
+          setIsPenDown(false);
           const activeJogSpeed = jogSpeed * (speedMultiplier / 100);
           await invoke("home_plotter", { speed: activeJogSpeed });
           setCurrentPos({ x: 0, y: 0 });
-          setIsPenDown(false); // Pen UP on home
           updateHomeTimestamp();
           setStatusMsg("Plotter at origin (0,0).");
         } catch (err: any) {
@@ -2440,7 +2986,9 @@ function App() {
   const penCapacityMeters = activeProfile ? activeProfile.capacityMeters : 1500;
 
   // Selected object transform properties (Prepare tab bindings)
-  const selectedObject = objects.find(o => o.id === selectedObjectId);
+  const selectedObject = selectedObjectId === "template-object"
+    ? ({ id: "template-object", name: "Gabarit d'Arrière-Plan", scale: templateScale, rotation: templateRotation, offsetX: templateOffsetX, offsetY: templateOffsetY } as any)
+    : objects.find(o => o.id === selectedObjectId);
 
   const canvasHeight = 550;
   const canvasWidth = Math.round(canvasHeight * (scaleWidth / scaleHeight));
@@ -2489,7 +3037,12 @@ function App() {
               {/* File Import */}
               <div className="card-section">
                 <h3 className="card-title">File Import</h3>
-                <div className="file-dropzone" onClick={() => document.getElementById("file-input")?.click()}>
+                <div 
+                  className="file-dropzone" 
+                  onClick={() => document.getElementById("file-input")?.click()}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={handleFileDrop}
+                >
                   <svg className="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
                     <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/>
@@ -2565,6 +3118,41 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {/* SVG Hatch Fill Settings */}
+              {objects.some(o => o.svgText !== undefined) && (
+                <div className="card-section">
+                  <h3 className="card-title">SVG Fill & Hatching</h3>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.85rem", fontWeight: "bold", cursor: "pointer", userSelect: "none", marginBottom: "10px" }}>
+                    <input 
+                      type="checkbox" 
+                      checked={enableSvgHatching} 
+                      onChange={(e) => setEnableSvgHatching(e.target.checked)} 
+                    />
+                    Enable Hatch Fill (Color Shapes)
+                  </label>
+
+                  {enableSvgHatching && (
+                    <div className="slider-group" style={{ borderTop: "1px solid var(--border-color)", paddingTop: "10px" }}>
+                      <div className="slider-header">
+                        <label>Pen Thickness / Hatch Spacing (mm)</label>
+                        <span className="slider-val">{svgHatchSpacing.toFixed(1)} mm</span>
+                      </div>
+                      <input 
+                        type="range" 
+                        min="0.2" 
+                        max="5.0" 
+                        step="0.1" 
+                        value={svgHatchSpacing} 
+                        onChange={(e) => setSvgHatchSpacing(parseFloat(e.target.value))} 
+                      />
+                      <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", display: "block", marginTop: "2px" }}>
+                        Set to your physical pen thickness (e.g. 0.4mm) for a solid fill, or higher for lines.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Raster settings if image */}
               {fileType === "image" && (
@@ -2681,6 +3269,74 @@ function App() {
                   <label>Safety Margins (mm)</label>
                   <input type="number" value={margin} onChange={(e) => { setMargin(parseFloat(e.target.value) || 0); setSlicingStats(null); setSlicedPaths([]); }} />
                 </div>
+              </div>
+
+              {/* Background Visual Template */}
+              <div className="card-section">
+                <h3 className="card-title">Background Visual Template</h3>
+                {!templateImage ? (
+                  <div 
+                    className="file-dropzone" 
+                    onClick={() => document.getElementById("template-input")?.click()} 
+                    style={{ padding: "12px", minHeight: "60px" }}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={handleTemplateDrop}
+                  >
+                    <svg className="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ width: "24px", height: "24px", marginBottom: "4px" }}>
+                      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                      <circle cx="8.5" cy="8.5" r="1.5"/>
+                      <polyline points="21 15 16 10 5 21"/>
+                    </svg>
+                    <p style={{ fontSize: "0.75rem", margin: 0 }}>Click to Load PNG/JPG Template</p>
+                    <input id="template-input" type="file" accept=".png,.jpg,.jpeg" onChange={handleTemplateUpload} style={{ display: "none" }} />
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: "0.8rem", color: "var(--success)", fontWeight: "bold" }}>Template Loaded</span>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button 
+                          className="btn btn-secondary" 
+                          onClick={() => {
+                            setIsTemplateLocked(!isTemplateLocked);
+                            if (!isTemplateLocked) {
+                              if (selectedObjectIds.includes("template-object")) {
+                                setSelectedObjectIds(prev => prev.filter(id => id !== "template-object"));
+                              }
+                            }
+                          }}
+                          style={{ padding: "4px 8px", fontSize: "0.75rem", display: "flex", alignItems: "center", gap: "4px", width: "auto" }}
+                          title={isTemplateLocked ? "Unlock template to move/rotate/scale it" : "Lock template to prevent accidental dragging"}
+                        >
+                          {isTemplateLocked ? "🔒 Locked" : "🔓 Unlock"}
+                        </button>
+                        <button className="btn btn-danger" onClick={() => { setTemplateImage(null); setStatusMsg("Template removed"); }} style={{ padding: "4px 8px", fontSize: "0.75rem", width: "auto" }}>
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="slider-group">
+                      <div className="slider-header">
+                        <label>Opacity</label>
+                        <span className="slider-val">{templateOpacity}%</span>
+                      </div>
+                      <input type="range" min="10" max="100" step="5" value={templateOpacity} onChange={(e) => setTemplateOpacity(parseInt(e.target.value))} />
+                    </div>
+
+                    <div className="slider-group">
+                      <div className="slider-header">
+                        <label>Scale</label>
+                        <span className="slider-val">{templateScale}%</span>
+                      </div>
+                      <input type="range" min="10" max="300" step="5" value={templateScale} onChange={(e) => setTemplateScale(parseInt(e.target.value))} />
+                    </div>
+
+                    <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                      {!isTemplateLocked ? "💡 Tip: Click and drag, rotate, or scale the template on the canvas directly!" : "🔒 Template locked. Unlock to drag/scale/rotate."}
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Pen Profile Presets & Life Tracker */}
@@ -2847,6 +3503,88 @@ function App() {
                   />
                   <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>Range: 150 - 500 ms</span>
                 </div>
+              </div>
+
+              {/* Priming Line Settings */}
+              <div className="card-section">
+                <h3 className="card-title">Priming Line Settings</h3>
+                <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.85rem", fontWeight: "bold", cursor: "pointer", userSelect: "none", marginBottom: "10px" }}>
+                  <input 
+                    type="checkbox" 
+                    checked={enablePrimingLine} 
+                    onChange={(e) => {
+                      setEnablePrimingLine(e.target.checked);
+                      if (e.target.checked) {
+                        setTimeout(() => handleAutoPositionPriming(), 0);
+                      }
+                    }} 
+                  />
+                  Enable Priming Line
+                </label>
+
+                {enablePrimingLine && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px", borderTop: "1px solid var(--border-color)", paddingTop: "10px" }}>
+                    <div className="form-row">
+                      <div className="form-group">
+                        <label>Start X (mm)</label>
+                        <input 
+                          type="number" 
+                          value={primingStartX === 0 || isNaN(primingStartX) ? "" : primingStartX} 
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPrimingStartX(val === "" ? 0 : parseFloat(val));
+                          }} 
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Start Y (mm)</label>
+                        <input 
+                          type="number" 
+                          value={primingStartY === 0 || isNaN(primingStartY) ? "" : primingStartY} 
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPrimingStartY(val === "" ? 0 : parseFloat(val));
+                          }} 
+                        />
+                      </div>
+                    </div>
+
+                    <div className="form-row" style={{ alignItems: "center" }}>
+                      <div className="form-group">
+                        <label>Length (mm)</label>
+                        <input 
+                          type="number" 
+                          value={primingLength === 0 || isNaN(primingLength) ? "" : primingLength} 
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPrimingLength(val === "" ? 0 : parseFloat(val));
+                          }} 
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Direction</label>
+                        <select 
+                          value={primingDirection} 
+                          onChange={(e) => {
+                            setPrimingDirection(e.target.value as "horizontal" | "vertical");
+                          }}
+                        >
+                          <option value="horizontal">Horizontal</option>
+                          <option value="vertical">Vertical</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={handleAutoPositionPriming}
+                      style={{ padding: "6px 12px", fontSize: "0.75rem", width: "100%", marginTop: "4px", border: "1px solid var(--accent-color)" }}
+                      title="Automatically place priming line adjacent to design boundaries to prevent drawing overlapping lines"
+                    >
+                      ⚡ Auto-position near design
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Execution panel */}
@@ -3050,7 +3788,11 @@ function App() {
                   <button 
                     className="btn btn-danger" 
                     onClick={() => {
-                      if (selectedObjectIds.length > 0) {
+                      if (selectedObjectIds.includes("template-object")) {
+                        setTemplateImage(null);
+                        setSelectedObjectIds([]);
+                        setStatusMsg("Template removed");
+                      } else if (selectedObjectIds.length > 0) {
                         setObjects(prev => prev.filter(o => !selectedObjectIds.includes(o.id)));
                         setSelectedObjectIds([]);
                         setSlicingStats(null);
@@ -3094,9 +3836,13 @@ function App() {
                         setInputScaleText(txt);
                         const val = parseInt(txt);
                         if (!isNaN(val) && val > 0) {
-                          setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scale: val } : o));
-                          setSlicingStats(null);
-                          setSlicedPaths([]);
+                          if (selectedObjectId === "template-object") {
+                            setTemplateScale(val);
+                          } else {
+                            setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scale: val } : o));
+                            setSlicingStats(null);
+                            setSlicedPaths([]);
+                          }
                         }
                       }}
                       style={{ width: "45px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
@@ -3108,8 +3854,8 @@ function App() {
                     <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Rot/Flip:</span>
                     <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("left")} title="Rotate 90° CCW">-90°</button>
                     <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => rotate90("right")} title="Rotate 90° CW">+90°</button>
-                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => flipObject("horizontal")} title="Flip horizontally">Flip H</button>
-                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject} onClick={() => flipObject("vertical")} title="Flip vertically">Flip V</button>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject || selectedObjectId === "template-object"} onClick={() => flipObject("horizontal")} title="Flip horizontally">Flip H</button>
+                    <button className="btn btn-secondary" style={{ padding: "2px 6px", fontSize: "0.7rem" }} disabled={activeTab === "preview" || !selectedObject || selectedObjectId === "template-object"} onClick={() => flipObject("vertical")} title="Flip vertically">Flip V</button>
                     <input 
                       type="number" 
                       value={inputRotationText} 
@@ -3119,9 +3865,13 @@ function App() {
                         setInputRotationText(txt);
                         const val = parseInt(txt);
                         if (!isNaN(val)) {
-                          setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, rotation: val } : o));
-                          setSlicingStats(null);
-                          setSlicedPaths([]);
+                          if (selectedObjectId === "template-object") {
+                            setTemplateRotation(val);
+                          } else {
+                            setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, rotation: val } : o));
+                            setSlicingStats(null);
+                            setSlicedPaths([]);
+                          }
                         }
                       }}
                       style={{ width: "40px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
