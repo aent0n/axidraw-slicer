@@ -6,6 +6,8 @@ export interface Point {
 export interface Toolpath {
   points: Point[];
   isFill?: boolean;
+  originallyFilled?: boolean;
+  objectId?: string;
 }
 
 function parseUnitToMm(valStr: string | null, defaultValue: number): number {
@@ -106,61 +108,355 @@ function parsePathElement(
   }
 }
 
-function generateHatching(polygons: Point[][], spacingMm: number): Toolpath[] {
-  const hatchPaths: Toolpath[] = [];
-  if (polygons.length === 0) return hatchPaths;
-
-  // Get bounding box of all polygons combined
-  let minY = Infinity, maxY = -Infinity;
-  polygons.forEach(poly => {
-    poly.forEach(pt => {
-      if (pt.y < minY) minY = pt.y;
-      if (pt.y > maxY) maxY = pt.y;
-    });
-  });
-
-  if (minY === Infinity || maxY === Infinity || (maxY - minY) < spacingMm) {
-    return hatchPaths;
+function isPointInPolygon(pt: Point, poly: Point[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    const intersect = ((yi > pt.y) !== (yj > pt.y))
+        && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
   }
+  return inside;
+}
 
-  // Generate horizontal lines across the vertical range of the shape
-  for (let y = minY + spacingMm / 2; y < maxY; y += spacingMm) {
-    const intersections: number[] = [];
+function generateOffsetFill(polygons: Point[][], spacingMm: number): Toolpath[] {
+  const fillPaths: Toolpath[] = [];
+  if (polygons.length === 0) return fillPaths;
 
-    // Find intersections with edges of ALL polygons combined
-    polygons.forEach(poly => {
-      if (poly.length < 3) return;
-      for (let i = 0; i < poly.length; i++) {
-        const p1 = poly[i];
-        const p2 = poly[(i + 1) % poly.length];
+  // Clean polygons: remove consecutive duplicates
+  const cleanedPolys = polygons.map(poly => {
+    return poly.filter((pt, idx) => {
+      const next = poly[(idx + 1) % poly.length];
+      return Math.hypot(pt.x - next.x, pt.y - next.y) > 0.01;
+    });
+  }).filter(poly => poly.length >= 3);
 
-        // Check if edge crosses the horizontal line at y
-        if ((p1.y <= y && p2.y > y) || (p2.y <= y && p1.y > y)) {
-          const t = (y - p1.y) / (p2.y - p1.y);
-          const intersectX = p1.x + t * (p2.x - p1.x);
-          intersections.push(intersectX);
+  cleanedPolys.forEach((poly, polyIdx) => {
+    // Determine if this polygon is a hole (contained by an odd number of other polygons)
+    let containCount = 0;
+    if (poly.length > 0) {
+      const pt = poly[0];
+      for (let j = 0; j < cleanedPolys.length; j++) {
+        if (j !== polyIdx) {
+          if (isPointInPolygon(pt, cleanedPolys[j])) {
+            containCount++;
+          }
         }
       }
+    }
+    const isHole = (containCount % 2) === 1;
+
+    // Calculate signed area
+    let area = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const p1 = poly[i];
+      const p2 = poly[(i + 1) % poly.length];
+      area += (p1.x * p2.y - p2.x * p1.y);
+    }
+
+    let currentPoly = [...poly];
+    // Enforce orientation: CCW for outer, CW for hole
+    if (isHole) {
+      if (area > 0) currentPoly.reverse();
+    } else {
+      if (area < 0) currentPoly.reverse();
+    }
+
+    // Keep offsetting inward/outward
+    const distance = spacingMm;
+    let limit = 500; // safety limit to prevent infinite loops
+    while (limit-- > 0) {
+      const offsetPoly: Point[] = [];
+      const N = currentPoly.length;
+      let collapsed = false;
+
+      for (let i = 0; i < N; i++) {
+        const p1 = currentPoly[(i - 1 + N) % N];
+        const p2 = currentPoly[i];
+        const p3 = currentPoly[(i + 1) % N];
+
+        const v1 = { x: p2.x - p1.x, y: p2.y - p1.y };
+        const v2 = { x: p3.x - p2.x, y: p3.y - p2.y };
+
+        const len1 = Math.hypot(v1.x, v1.y);
+        const len2 = Math.hypot(v2.x, v2.y);
+
+        if (len1 < 0.001 || len2 < 0.001) {
+          collapsed = true;
+          break;
+        }
+
+        const u1 = { x: v1.x / len1, y: v1.y / len1 };
+        const u2 = { x: v2.x / len2, y: v2.y / len2 };
+
+        // Left normal: (-u_y, u_x)
+        const n1 = { x: -u1.y, y: u1.x };
+        const n2 = { x: -u2.y, y: u2.x };
+
+        const bis = { x: n1.x + n2.x, y: n1.y + n2.y };
+        const bisLen = Math.hypot(bis.x, bis.y);
+
+        if (bisLen < 0.01) {
+          offsetPoly.push({ x: p2.x + distance * n1.x, y: p2.y + distance * n1.y });
+          continue;
+        }
+
+        const bisNorm = { x: bis.x / bisLen, y: bis.y / bisLen };
+        const dot = bisNorm.x * n1.x + bisNorm.y * n1.y;
+
+        if (dot < 0.01) {
+          collapsed = true;
+          break;
+        }
+
+        const s = 1.0 / dot;
+        const scaleFactor = Math.min(s, 3.0); // limit extreme spikes at sharp corners
+
+        offsetPoly.push({
+          x: p2.x + distance * scaleFactor * bisNorm.x,
+          y: p2.y + distance * scaleFactor * bisNorm.y
+        });
+      }
+
+      if (collapsed || offsetPoly.length < 3) break;
+
+      // Check if area orientation has inverted
+      let offsetArea = 0;
+      for (let i = 0; i < offsetPoly.length; i++) {
+        const p1 = offsetPoly[i];
+        const p2 = offsetPoly[(i + 1) % offsetPoly.length];
+        offsetArea += (p1.x * p2.y - p2.x * p1.y);
+      }
+
+      // If area changed sign or collapsed, stop
+      if (isHole) {
+        if (offsetArea >= -0.01) break;
+      } else {
+        if (offsetArea <= 0.01) break;
+      }
+
+      // Clean duplicates
+      const cleaned = offsetPoly.filter((pt, idx) => {
+        const next = offsetPoly[(idx + 1) % offsetPoly.length];
+        return Math.hypot(pt.x - next.x, pt.y - next.y) > 0.05;
+      });
+
+      if (cleaned.length < 3) break;
+
+      fillPaths.push({
+        points: [...cleaned, cleaned[0]]
+      });
+
+      currentPoly = cleaned;
+    }
+  });
+
+  return fillPaths;
+}
+
+function generateHatching(
+  polygons: Point[][],
+  spacingMm: number,
+  angleDeg: number = 0,
+  crossHatch: boolean = false
+): Toolpath[] {
+  const generateSingleHatch = (ang: number): Toolpath[] => {
+    const hatchPaths: Toolpath[] = [];
+    if (polygons.length === 0) return hatchPaths;
+
+    // 1. Calculate center of all polygons combined
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    polygons.forEach(poly => {
+      poly.forEach(pt => {
+        if (pt.x < minX) minX = pt.x;
+        if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y;
+        if (pt.y > maxY) maxY = pt.y;
+      });
     });
 
-    // Sort intersections from left to right
-    intersections.sort((a, b) => a - b);
+    if (minX === Infinity || minY === Infinity) return hatchPaths;
+    const center = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+    const rad = (ang * Math.PI) / 180;
 
-    // Connect pairs of intersections (Odd-Even fill rule across all sub-paths)
-    for (let i = 0; i < intersections.length - 1; i += 2) {
-      hatchPaths.push({
-        points: [
-          { x: intersections[i], y: y },
-          { x: intersections[i + 1], y: y }
-        ]
+    // 2. Rotate all polygons by -rad around center
+    const rotatedPolys = polygons.map(poly =>
+      poly.map(pt => {
+        const dx = pt.x - center.x;
+        const dy = pt.y - center.y;
+        return {
+          x: center.x + dx * Math.cos(-rad) - dy * Math.sin(-rad),
+          y: center.y + dx * Math.sin(-rad) + dy * Math.cos(-rad)
+        };
+      })
+    );
+
+    // 3. Find rotated bounding box
+    let rMinY = Infinity, rMaxY = -Infinity;
+    rotatedPolys.forEach(poly => {
+      poly.forEach(pt => {
+        if (pt.y < rMinY) rMinY = pt.y;
+        if (pt.y > rMaxY) rMaxY = pt.y;
       });
+    });
+
+    if (rMinY === Infinity || (rMaxY - rMinY) < spacingMm) {
+      return hatchPaths;
+    }
+
+    // 4. Generate scanlines in rotated space
+    for (let y = rMinY + spacingMm / 2; y < rMaxY; y += spacingMm) {
+      const intersections: number[] = [];
+
+      rotatedPolys.forEach(poly => {
+        if (poly.length < 3) return;
+        for (let i = 0; i < poly.length; i++) {
+          const p1 = poly[i];
+          const p2 = poly[(i + 1) % poly.length];
+
+          if ((p1.y <= y && p2.y > y) || (p2.y <= y && p1.y > y)) {
+            const t = (y - p1.y) / (p2.y - p1.y);
+            const intersectX = p1.x + t * (p2.x - p1.x);
+            intersections.push(intersectX);
+          }
+        }
+      });
+
+      intersections.sort((a, b) => a - b);
+
+      for (let i = 0; i < intersections.length - 1; i += 2) {
+        const p1Rotated = { x: intersections[i], y: y };
+        const p2Rotated = { x: intersections[i + 1], y: y };
+
+        const rotateBack = (pt: Point) => {
+          const dx = pt.x - center.x;
+          const dy = pt.y - center.y;
+          return {
+            x: center.x + dx * Math.cos(rad) - dy * Math.sin(rad),
+            y: center.y + dx * Math.sin(rad) + dy * Math.cos(rad)
+          };
+        };
+
+        hatchPaths.push({
+          points: [rotateBack(p1Rotated), rotateBack(p2Rotated)]
+        });
+      }
+    }
+
+    return hatchPaths;
+  };
+
+  const results = generateSingleHatch(angleDeg);
+  if (crossHatch) {
+    results.push(...generateSingleHatch((angleDeg + 90) % 180));
+  }
+  return results;
+}
+
+function isColorDark(colorStr: string): boolean {
+  const str = colorStr.trim().toLowerCase();
+  if (str === "none" || str === "transparent" || str === "") return false;
+  
+  // Hex formats
+  if (str.startsWith("#")) {
+    const hex = str.substring(1);
+    let r = 255, g = 255, b = 255;
+    if (hex.length === 3) {
+      r = parseInt(hex[0] + hex[0], 16);
+      g = parseInt(hex[1] + hex[1], 16);
+      b = parseInt(hex[2] + hex[2], 16);
+    } else if (hex.length === 6) {
+      r = parseInt(hex.substring(0, 2), 16);
+      g = parseInt(hex.substring(2, 4), 16);
+      b = parseInt(hex.substring(4, 6), 16);
+    }
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance < 200;
+  }
+  
+  // RGB formats
+  if (str.startsWith("rgb")) {
+    const parts = str.match(/\d+/g);
+    if (parts && parts.length >= 3) {
+      const r = parseInt(parts[0]);
+      const g = parseInt(parts[1]);
+      const b = parseInt(parts[2]);
+      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+      return luminance < 200;
+    }
+  }
+  
+  // Named colors
+  const lightColors = ["white", "yellow", "ivory", "lightyellow", "lightgray", "lightgrey", "whitesmoke", "beige", "transparent"];
+  if (lightColors.includes(str)) return false;
+  
+  return true; // Default to dark/drawable if unknown
+}
+
+function getElementFillColor(el: Element): string {
+  // 1. Direct attribute
+  const fillAttr = el.getAttribute("fill");
+  if (fillAttr) return fillAttr.trim();
+  
+  // 2. Inline style attribute
+  const styleAttr = el.getAttribute("style");
+  if (styleAttr) {
+    const match = styleAttr.match(/(?:^|;)\s*fill\s*:\s*([^;]+)/);
+    if (match) return match[1].trim();
+  }
+  
+  // 3. Fallback to computed style (only if available)
+  try {
+    const computedStyle = window.getComputedStyle(el);
+    if (computedStyle && computedStyle.fill) {
+      return computedStyle.fill.trim();
+    }
+  } catch (e) {}
+  
+  return "";
+}
+
+function shouldFillElement(el: Element, dAttr: string): boolean {
+  const tag = el.tagName.toLowerCase();
+  
+  // Lines and polylines are open strokes, never filled/hatched
+  if (tag === "line" || tag === "polyline") {
+    return false;
+  }
+  
+  // Paths must be closed to be filled/hatched (contain 'z' command)
+  if (tag === "path") {
+    const dLower = dAttr.toLowerCase();
+    if (!dLower.includes("z")) {
+      return false; // Open path, do not fill
     }
   }
 
-  return hatchPaths;
+  const fillColor = getElementFillColor(el).toLowerCase();
+  if (fillColor === "none" || fillColor === "") {
+    return false;
+  }
+
+  // Skip white or light fills which usually represent background/paper card backing
+  if (!isColorDark(fillColor)) {
+    return false;
+  }
+
+  return true;
 }
 
-export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightMm: number = 210, svgHatchSpacing: number = 1.0, enableHatching: boolean = false): Toolpath[] {
+export function parseSVG(
+  svgText: string,
+  _bedWidthMm: number = 297,
+  _bedHeightMm: number = 210,
+  svgHatchSpacing: number = 1.0,
+  enableHatching: boolean = false,
+  svgHatchStyle: "hatch" | "concentric" = "hatch",
+  svgHatchAngle: number = 0,
+  svgCrossHatch: boolean = false
+): Toolpath[] {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svgText, "image/svg+xml");
   const svgEl = doc.querySelector("svg");
@@ -210,21 +506,7 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
 
   drawables.forEach((el) => {
     let dAttr = el.getAttribute("d") || "";
-
-    // Check if the element has a fill color that is not 'none'
-    const fillAttr = el.getAttribute("fill");
-    const styleAttr = el.getAttribute("style") || "";
-    const styleFillMatch = styleAttr.match(/fill\s*:\s*([^;]+)/);
-    const styleFill = styleFillMatch ? styleFillMatch[1].trim() : null;
-    
-    // Check class-based styling computed by the browser
-    const computedStyle = window.getComputedStyle(el);
-    const computedFill = computedStyle ? computedStyle.fill : "";
-    const hasClass = el.getAttribute("class") !== null;
-
-    const finalFill = fillAttr || styleFill;
-    const hasFill = (finalFill !== null && finalFill !== "none") ||
-                    (hasClass && computedFill !== "none" && computedFill !== "");
+    const hasFill = shouldFillElement(el, dAttr);
 
     if (el.tagName.toLowerCase() === "path") {
       // Split the path data by 'M' or 'm' commands using positive lookahead
@@ -251,13 +533,16 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
         tempSvg.removeChild(subPathEl);
       });
 
+      elementPaths.forEach(ep => ep.originallyFilled = hasFill);
       paths.push(...elementPaths);
 
       if (enableHatching && hasFill && elementPaths.length > 0) {
         const polygons = elementPaths.map(ep => ep.points);
-        const hatches = generateHatching(polygons, svgHatchSpacing);
-        hatches.forEach(h => h.isFill = true);
-        paths.push(...hatches);
+        const fillPaths = svgHatchStyle === "concentric"
+          ? generateOffsetFill(polygons, svgHatchSpacing)
+          : generateHatching(polygons, svgHatchSpacing, svgHatchAngle, svgCrossHatch);
+        fillPaths.forEach(h => h.isFill = true);
+        paths.push(...fillPaths);
       }
     } else {
       // Convert other shapes to path data
@@ -274,13 +559,16 @@ export function parseSVG(svgText: string, _bedWidthMm: number = 297, _bedHeightM
           parsePathElement(newPath, tempSvg, scaleX, scaleY, resolution, elementPaths);
           tempSvg.removeChild(newPath);
 
+          elementPaths.forEach(ep => ep.originallyFilled = hasFill);
           paths.push(...elementPaths);
 
           if (enableHatching && hasFill && elementPaths.length > 0) {
             const polygons = elementPaths.map(ep => ep.points);
-            const hatches = generateHatching(polygons, svgHatchSpacing);
-            hatches.forEach(h => h.isFill = true);
-            paths.push(...hatches);
+            const fillPaths = svgHatchStyle === "concentric"
+              ? generateOffsetFill(polygons, svgHatchSpacing)
+              : generateHatching(polygons, svgHatchSpacing, svgHatchAngle, svgCrossHatch);
+            fillPaths.forEach(h => h.isFill = true);
+            paths.push(...fillPaths);
           }
         }
       } catch (err) {

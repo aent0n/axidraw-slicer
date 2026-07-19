@@ -11,6 +11,8 @@ interface Point {
 interface Toolpath {
   points: Point[];
   isFill?: boolean;
+  originallyFilled?: boolean;
+  objectId?: string;
 }
 
 interface ProgressPayload {
@@ -43,6 +45,7 @@ interface PenProfile {
   name: string;
   capacityMeters: number;
   accumulatedDistanceMeters: number;
+  tipSizeMm: number;
 }
 
 interface PastJob {
@@ -60,9 +63,11 @@ interface SlicerObject {
   rawPaths: Toolpath[];
   offsetX: number;
   offsetY: number;
-  scale: number;
+  scaleX: number;
+  scaleY: number;
   rotation: number;
   svgText?: string;
+  isMonoline?: boolean;
 }
 
 const formatTime = (secs: number): string => {
@@ -72,6 +77,223 @@ const formatTime = (secs: number): string => {
 };
 
 const CANVAS_PADDING = 20;
+
+function skeletonize(width: number, height: number, pixels: Uint8ClampedArray): Uint8Array {
+  const grid = new Uint8Array(width * height);
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    const a = pixels[i + 3];
+    const luminance = (0.299 * r + 0.587 * g + 0.114 * b);
+    // Permissive threshold to capture faint anti-aliased pixels of thin paths
+    grid[i / 4] = (luminance < 240 && a > 30) ? 1 : 0;
+  }
+
+  let changed = true;
+  const toDelete: number[] = [];
+
+  const getNeighbors = (x: number, y: number) => {
+    const n = new Uint8Array(9);
+    n[0] = 0;
+    n[1] = y > 0 ? grid[(y - 1) * width + x] : 0; 
+    n[2] = (y > 0 && x < width - 1) ? grid[(y - 1) * width + x + 1] : 0; 
+    n[3] = x < width - 1 ? grid[y * width + x + 1] : 0; 
+    n[4] = (y < height - 1 && x < width - 1) ? grid[(y + 1) * width + x + 1] : 0; 
+    n[5] = y < height - 1 ? grid[(y + 1) * width + x] : 0; 
+    n[6] = (y < height - 1 && x > 0) ? grid[(y + 1) * width + x - 1] : 0; 
+    n[7] = x > 0 ? grid[y * width + x - 1] : 0; 
+    n[8] = (y > 0 && x > 0) ? grid[(y - 1) * width + x - 1] : 0; 
+    return n;
+  };
+
+  while (changed) {
+    changed = false;
+    
+    toDelete.length = 0;
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const idx = y * width + x;
+        if (grid[idx] === 0) continue;
+
+        const n = getNeighbors(x, y);
+        const B = n[1] + n[2] + n[3] + n[4] + n[5] + n[6] + n[7] + n[8];
+        let A = 0;
+        for (let i = 1; i < 8; i++) {
+          if (n[i] === 0 && n[i + 1] === 1) A++;
+        }
+        if (n[8] === 0 && n[1] === 1) A++;
+
+        if (B >= 2 && B <= 6 && A === 1) {
+          const cond1 = n[1] * n[3] * n[5] === 0; 
+          const cond2 = n[3] * n[5] * n[7] === 0; 
+          if (cond1 && cond2) {
+            toDelete.push(idx);
+          }
+        }
+      }
+    }
+    if (toDelete.length > 0) {
+      toDelete.forEach(idx => grid[idx] = 0);
+      changed = true;
+    }
+
+    toDelete.length = 0;
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const idx = y * width + x;
+        if (grid[idx] === 0) continue;
+
+        const n = getNeighbors(x, y);
+        const B = n[1] + n[2] + n[3] + n[4] + n[5] + n[6] + n[7] + n[8];
+        let A = 0;
+        for (let i = 1; i < 8; i++) {
+          if (n[i] === 0 && n[i + 1] === 1) A++;
+        }
+        if (n[8] === 0 && n[1] === 1) A++;
+
+        if (B >= 2 && B <= 6 && A === 1) {
+          const cond1 = n[1] * n[3] * n[7] === 0; 
+          const cond2 = n[1] * n[5] * n[7] === 0; 
+          if (cond1 && cond2) {
+            toDelete.push(idx);
+          }
+        }
+      }
+    }
+    if (toDelete.length > 0) {
+      toDelete.forEach(idx => grid[idx] = 0);
+      changed = true;
+    }
+  }
+
+  return grid;
+}
+
+function traceSkeleton(width: number, height: number, grid: Uint8Array): Point[][] {
+  const paths: Point[][] = [];
+  const visited = new Uint8Array(width * height);
+
+  const countNeighbors = (x: number, y: number) => {
+    let count = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+          if (grid[ny * width + nx] === 1) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  };
+
+  const getNextNeighbor = (x: number, y: number) => {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+          const idx = ny * width + nx;
+          if (grid[idx] === 1 && visited[idx] === 0) {
+            return { x: nx, y: ny };
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (grid[idx] === 1 && visited[idx] === 0) {
+        const neighbors = countNeighbors(x, y);
+        if (neighbors === 1) {
+          const path: Point[] = [];
+          let cx = x;
+          let cy = y;
+          
+          while (true) {
+            const cidx = cy * width + cx;
+            visited[cidx] = 1;
+            path.push({ x: cx, y: cy });
+            
+            const next = getNextNeighbor(cx, cy);
+            if (!next) break;
+            cx = next.x;
+            cy = next.y;
+          }
+          if (path.length >= 2) {
+            paths.push(path);
+          }
+        }
+      }
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (grid[idx] === 1 && visited[idx] === 0) {
+        const path: Point[] = [];
+        let cx = x;
+        let cy = y;
+        
+        while (true) {
+          const cidx = cy * width + cx;
+          visited[cidx] = 1;
+          path.push({ x: cx, y: cy });
+          
+          const next = getNextNeighbor(cx, cy);
+          if (!next) break;
+          cx = next.x;
+          cy = next.y;
+        }
+        
+        if (path.length >= 3) {
+          const first = path[0];
+          const last = path[path.length - 1];
+          if (Math.abs(first.x - last.x) <= 1 && Math.abs(first.y - last.y) <= 1) {
+            path.push({ ...first });
+          }
+        }
+        
+        if (path.length >= 2) {
+          paths.push(path);
+        }
+      }
+    }
+  }
+
+  return paths;
+}
+
+
+function smoothPath(points: Point[], iterations: number = 3): Point[] {
+  if (points.length <= 2) return points;
+  let curr = [...points];
+  for (let iter = 0; iter < iterations; iter++) {
+    const next: Point[] = [];
+    next.push({ ...curr[0] }); // keep start point
+    for (let i = 1; i < curr.length - 1; i++) {
+      const prev = curr[i - 1];
+      const c = curr[i];
+      const n = curr[i + 1];
+      next.push({
+        x: (prev.x + 2 * c.x + n.x) / 4,
+        y: (prev.y + 2 * c.y + n.y) / 4
+      });
+    }
+    next.push({ ...curr[curr.length - 1] }); // keep end point
+    curr = next;
+  }
+  return curr;
+}
 
 function App() {
   // Navigation Tabs: Prepare / Preview / Monitor
@@ -135,6 +357,13 @@ function App() {
   // SVG Fill settings
   const [svgHatchSpacing, setSvgHatchSpacing] = useState<number>(1.0); // mm
   const [enableSvgHatching, setEnableSvgHatching] = useState<boolean>(false);
+  const [svgHatchStyle, setSvgHatchStyle] = useState<"hatch" | "concentric">("hatch");
+  const [svgHatchAngle, setSvgHatchAngle] = useState<number>(45); // degrees
+  const [svgCrossHatch, setSvgCrossHatch] = useState<boolean>(false);
+
+  // Local input buffer states for smooth dragging
+  const [localHatchSpacing, setLocalHatchSpacing] = useState<number>(1.0);
+  const [localHatchAngle, setLocalHatchAngle] = useState<number>(45);
 
   // Slicer Multi-Object State & Selection Grouping
   const [objects, setObjects] = useState<SlicerObject[]>([]);
@@ -144,6 +373,12 @@ function App() {
   // Input text buffer states (to prevent snapping/resetting while typing)
   const [inputScaleText, setInputScaleText] = useState("");
   const [inputRotationText, setInputRotationText] = useState("");
+  const [inputWidthText, setInputWidthText] = useState("");
+  const [inputHeightText, setInputHeightText] = useState("");
+
+  // Loading states
+  const [isCalculatingHatch, setIsCalculatingHatch] = useState(false);
+  const [loadingText, setLoadingText] = useState<string | null>(null);
 
   // Mouse Drag-and-Drop Positioning / Scaling / Rotating states
   const [isDragging, setIsDragging] = useState(false);
@@ -163,6 +398,7 @@ function App() {
   const [simulatedPointsCount, setSimulatedPointsCount] = useState<number | null>(null);
   const [slicedPaths, setSlicedPaths] = useState<Toolpath[]>([]); // NN-optimized paths
   const [rawSlicedPaths, setRawSlicedPaths] = useState<Toolpath[]>([]); // Sliced paths without priming line
+  const [recoverySession, setRecoverySession] = useState<any | null>(null);
 
   // Pen Profiles Manager
   const [penProfiles, setPenProfiles] = useState<PenProfile[]>(() => {
@@ -170,20 +406,25 @@ function App() {
       const saved = localStorage.getItem("axidraw_pen_profiles");
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       }
     } catch (e) {
       console.error("Error loading pen profiles:", e);
     }
-    return [];
+    return [
+      { id: "default-fine", name: "Ultra Fine (0.2mm)", capacityMeters: 1000, accumulatedDistanceMeters: 0, tipSizeMm: 0.2 },
+      { id: "default-medium", name: "Medium Fine (0.4mm)", capacityMeters: 1500, accumulatedDistanceMeters: 0, tipSizeMm: 0.4 },
+      { id: "default-broad", name: "Broad Sharpie (1.0mm)", capacityMeters: 2000, accumulatedDistanceMeters: 0, tipSizeMm: 1.0 }
+    ];
   });
   const [activeProfileId, setActiveProfileId] = useState<string>(() => {
-    return localStorage.getItem("axidraw_active_profile_id") || "";
+    return localStorage.getItem("axidraw_active_profile_id") || "default-medium";
   });
   
   // Custom Profile Add
   const [newPenName, setNewPenName] = useState("");
   const [newPenCapacity, setNewPenCapacity] = useState(1000);
+  const [newPenTipSize, setNewPenTipSize] = useState<number>(0.4);
 
   // Pen State tracking (UP / DOWN)
   const [isPenDown, setIsPenDown] = useState(false);
@@ -211,6 +452,8 @@ function App() {
   const [consoleHeight, setConsoleHeight] = useState(450); // Drag-to-resize EBB logs console height
   const [isResizingConsole, setIsResizingConsole] = useState(false);
   const [showFuturePath, setShowFuturePath] = useState(true);
+  const [simulatePenWidth, setSimulatePenWidth] = useState(true);
+  const [monolineMergeWidth, setMonolineMergeWidth] = useState(0.8);
   const [monitorZoom, setMonitorZoom] = useState(1.0);
 
   // Live print job metrics state
@@ -241,7 +484,7 @@ function App() {
   // Canvas & Scroll-wheel References
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasWrapperRef = useRef<HTMLDivElement | null>(null);
-  const consoleEndRef = useRef<HTMLDivElement | null>(null);
+  const consoleContainerRef = useRef<HTMLDivElement | null>(null);
   const monitorCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const consoleCardRef = useRef<HTMLDivElement | null>(null);
   
@@ -336,11 +579,35 @@ function App() {
   const scaleHeightRef = useRef(scaleHeight);
   useEffect(() => { scaleHeightRef.current = scaleHeight; }, [scaleHeight]);
 
+  const objectsRef = useRef(objects);
+  useEffect(() => { objectsRef.current = objects; }, [objects]);
+
   const activeProfileIdRef = useRef(activeProfileId);
   useEffect(() => { activeProfileIdRef.current = activeProfileId; }, [activeProfileId]);
 
   const addToJobHistoryRef = useRef<((aborted: boolean) => void) | null>(null);
   useEffect(() => { addToJobHistoryRef.current = addToJobHistory; }, [addToJobHistory]);
+
+  const svgHatchStyleRef = useRef(svgHatchStyle);
+  useEffect(() => { svgHatchStyleRef.current = svgHatchStyle; }, [svgHatchStyle]);
+
+  const svgHatchAngleRef = useRef(svgHatchAngle);
+  useEffect(() => { svgHatchAngleRef.current = svgHatchAngle; }, [svgHatchAngle]);
+
+   const svgCrossHatchRef = useRef(svgCrossHatch);
+  useEffect(() => { svgCrossHatchRef.current = svgCrossHatch; }, [svgCrossHatch]);
+
+  const lastDistanceDrawnRef = useRef(0);
+  const initialDrawnMetersOfRunRef = useRef(0);
+
+  // Synchronize local slider buffer states with primary states
+  useEffect(() => {
+    setLocalHatchSpacing(svgHatchSpacing);
+  }, [svgHatchSpacing]);
+
+  useEffect(() => {
+    setLocalHatchAngle(svgHatchAngle);
+  }, [svgHatchAngle]);
 
   const getRawObjectBounds = (obj: SlicerObject) => {
     if (obj.rawPaths.length === 0) return null;
@@ -360,7 +627,8 @@ function App() {
 
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
-    const scaleFactor = obj.scale / 100;
+    const scaleFactorX = obj.scaleX / 100;
+    const scaleFactorY = obj.scaleY / 100;
     const rad = (obj.rotation * Math.PI) / 180;
     const cos = Math.cos(rad);
     const sin = Math.sin(rad);
@@ -375,8 +643,8 @@ function App() {
       path.points.forEach((pt) => {
         let x = pt.x - cx;
         let y = pt.y - cy;
-        x *= scaleFactor;
-        y *= scaleFactor;
+        x *= scaleFactorX;
+        y *= scaleFactorY;
         const rx = x * cos - y * sin;
         const ry = x * sin + y * cos;
         const finalX = bedCenterX + rx;
@@ -513,7 +781,8 @@ function App() {
       const cx = (minX + maxX) / 2;
       const cy = (minY + maxY) / 2;
 
-      const scaleFactor = obj.scale / 100;
+      const scaleFactorX = obj.scaleX / 100;
+      const scaleFactorY = obj.scaleY / 100;
       const rad = (obj.rotation * Math.PI) / 180;
       const cos = Math.cos(rad);
       const sin = Math.sin(rad);
@@ -526,8 +795,8 @@ function App() {
           let x = pt.x - cx;
           let y = pt.y - cy;
 
-          x *= scaleFactor;
-          y *= scaleFactor;
+          x *= scaleFactorX;
+          y *= scaleFactorY;
 
           const rx = x * cos - y * sin;
           const ry = x * sin + y * cos;
@@ -548,7 +817,9 @@ function App() {
         const simplifiedPoints = simplifyRDP(points, 0.04);
         return { 
           points: simplifiedPoints,
-          isFill: path.isFill
+          isFill: path.isFill,
+          originallyFilled: path.originallyFilled,
+          objectId: obj.id
         };
       });
 
@@ -589,58 +860,97 @@ function App() {
   };
 
   const processFile = (file: File) => {
-    const reader = new FileReader();
-    const fileNameLower = file.name.toLowerCase();
-    if (fileNameLower.endsWith(".svg")) {
-      setFileType("svg");
-      reader.onload = (event) => {
-        const svgText = event.target?.result as string;
-        try {
-          const parsed = parseSVG(svgText, scaleWidth, scaleHeight, svgHatchSpacing, enableSvgHatching);
-          
-          // Resolve duplicate name
-          let finalName = file.name;
-          let count = 1;
-          const extIdx = file.name.lastIndexOf(".");
-          const base = extIdx !== -1 ? file.name.substring(0, extIdx) : file.name;
-          const ext = extIdx !== -1 ? file.name.substring(extIdx) : "";
-          
-          while (objects.some(o => o.name === finalName)) {
-            finalName = `${base} (${count})${ext}`;
-            count++;
-          }
+    setLoadingText("Importing File...");
+    setTimeout(() => {
+      const reader = new FileReader();
+      const fileNameLower = file.name.toLowerCase();
+      if (fileNameLower.endsWith(".svg")) {
+        setFileType("svg");
+        reader.onload = (event) => {
+          const svgText = event.target?.result as string;
+          try {
+            // First check if it is a valid XML file using DOMParser
+            const xmlParser = new DOMParser();
+            const xmlDoc = xmlParser.parseFromString(svgText, "image/svg+xml");
+            const parserError = xmlDoc.querySelector("parsererror");
+            if (parserError) {
+              throw new Error(`XML Syntax Error: ${parserError.textContent}`);
+            }
 
-          const newObj: SlicerObject = {
-            id: `obj-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            name: finalName,
-            rawPaths: parsed,
-            offsetX: 0,
-            offsetY: 0,
-            scale: 100,
-            rotation: 0,
-            svgText: svgText
-          };
-          setObjects(prev => [...prev, newObj]);
-          setSelectedObjectIds([newObj.id]);
-          setSlicingStats(null);
-          setSlicedPaths([]);
-          setStatusMsg(`Loaded SVG object: ${finalName}`);
-        } catch (err: any) {
-          setStatusMsg(`SVG Error: ${err.message}`);
-        }
-      };
-      reader.readAsText(file);
-    } else {
-      setFileType("image");
-      setImagePreviewUrl(URL.createObjectURL(file));
-      setFileName(file.name);
-      reader.onload = (event) => {
-        const buffer = event.target?.result as ArrayBuffer;
-        setImageBytes(new Uint8Array(buffer));
-        setStatusMsg("Image loaded. Configure vectorizer and click Generate.");
-      };
-      reader.readAsArrayBuffer(file);
-    }
+            const parsed = parseSVG(
+              svgText, 
+              scaleWidth, 
+              scaleHeight, 
+              svgHatchSpacing, 
+              enableSvgHatching,
+              svgHatchStyle,
+              svgHatchAngle,
+              svgCrossHatch
+            );
+
+            if (parsed.length === 0) {
+              throw new Error("No printable paths or vector elements found. Verify that the file contains vector shapes or lines, not just embedded raster images.");
+            }
+            
+            // Resolve duplicate name
+            let finalName = file.name;
+            let count = 1;
+            const extIdx = file.name.lastIndexOf(".");
+            const base = extIdx !== -1 ? file.name.substring(0, extIdx) : file.name;
+            const ext = extIdx !== -1 ? file.name.substring(extIdx) : "";
+            
+            while (objects.some(o => o.name === finalName)) {
+              finalName = `${base} (${count})${ext}`;
+              count++;
+            }
+
+            const newObj: SlicerObject = {
+              id: `obj-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              name: finalName,
+              rawPaths: parsed,
+              offsetX: 0,
+              offsetY: 0,
+              scaleX: 100,
+              scaleY: 100,
+              rotation: 0,
+              svgText: svgText
+            };
+            setObjects(prev => [...prev, newObj]);
+            setSelectedObjectIds([newObj.id]);
+            setSlicingStats(null);
+            setRawSlicedPaths([]);
+            setStatusMsg(`Loaded SVG object: ${finalName}`);
+          } catch (err: any) {
+            console.error("SVG Import failed:", err);
+            const errMsg = err.message || err;
+            setStatusMsg(`SVG Error: ${errMsg}`);
+            alert(`Failed to parse SVG file: ${file.name}\n\nReason: ${errMsg}\n\nTroubleshooting suggestions:\n- If you exported from Illustrator/Inkscape/Figma, make sure to export as standard SVG (not proprietary/editor formats).\n- Check that the file actually contains vector paths or shapes.\n- Convert text elements to paths (curves/contours) before exporting.`);
+          } finally {
+            setLoadingText(null);
+          }
+        };
+        reader.onerror = () => {
+          setStatusMsg("Error reading file.");
+          setLoadingText(null);
+        };
+        reader.readAsText(file);
+      } else {
+        setFileType("image");
+        setImagePreviewUrl(URL.createObjectURL(file));
+        setFileName(file.name);
+        reader.onload = (event) => {
+          const buffer = event.target?.result as ArrayBuffer;
+          setImageBytes(new Uint8Array(buffer));
+          setStatusMsg("Image loaded. Configure vectorizer and click Generate.");
+          setLoadingText(null);
+        };
+        reader.onerror = () => {
+          setStatusMsg("Error reading file.");
+          setLoadingText(null);
+        };
+        reader.readAsArrayBuffer(file);
+      }
+    }, 50);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -713,14 +1023,15 @@ function App() {
         rawPaths: result,
         offsetX: 0,
         offsetY: 0,
-        scale: 100,
+        scaleX: 100,
+        scaleY: 100,
         rotation: 0
       };
 
       setObjects(prev => [...prev, newObj]);
       setSelectedObjectIds([newObj.id]);
       setSlicingStats(null);
-      setSlicedPaths([]);
+      setRawSlicedPaths([]);
       setStatusMsg("Generated vectorized object from image");
     } catch (err: any) {
       setStatusMsg(`Vectorizer failed: ${err}`);
@@ -740,7 +1051,7 @@ function App() {
     setIsGenerating(true);
     setStatusMsg("Optimizing vector density to current scale...");
     try {
-      const scaleFactor = selected.scale / 100;
+      const scaleFactor = selected.scaleX / 100;
       // Calculate target physical size based on the current scale percentage
       const targetW = scaleWidth * scaleFactor;
       const targetH = scaleHeight * scaleFactor;
@@ -771,20 +1082,224 @@ function App() {
           return {
             ...o,
             rawPaths: result,
-            scale: 100 // Reset scale to 100% since its physical paths are now exactly sized!
+            scaleX: 100,
+            scaleY: 100 // Reset scale to 100% since its physical paths are now exactly sized!
           };
         }
         return o;
       }));
 
       setSlicingStats(null);
-      setSlicedPaths([]);
+      setRawSlicedPaths([]);
       setStatusMsg("Vector density optimized successfully for current scale!");
     } catch (err: any) {
       setStatusMsg(`Optimization failed: ${err}`);
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  const handleConvertToMonoline = (objId: string) => {
+    const obj = objects.find(o => o.id === objId);
+    if (!obj || obj.rawPaths.length === 0) return;
+
+    setLoadingText("Converting to Monoline...");
+    setTimeout(() => {
+      try {
+        const rawBounds = getUnrotatedObjectBounds(obj);
+        if (!rawBounds) throw new Error("Could not calculate object bounds");
+
+        const rawW = rawBounds.maxX - rawBounds.minX;
+        const rawH = rawBounds.maxY - rawBounds.minY;
+        if (rawW <= 0.1 || rawH <= 0.1) throw new Error("Object is too small to vectorize");
+
+        // Create offscreen canvas at high resolution
+        const canvasW = 2000; // Increased resolution for better precision
+        const canvasH = Math.max(10, Math.round(canvasW * (rawH / rawW)));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = canvasW;
+        canvas.height = canvasH;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) throw new Error("Could not get 2D canvas context");
+
+        // Clear canvas to white
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, canvasW, canvasH);
+
+        const scale = canvasW / rawW;
+
+        // Convert the merge width in mm to canvas pixels.
+        // We draw outline paths with a base 3.0px width so they never disappear or get anti-aliased away.
+        const mergePixelWidth = (monolineMergeWidth / rawW) * canvasW;
+        const desiredPixelWidth = Math.max(3.0, mergePixelWidth);
+
+        ctx.strokeStyle = "black";
+        ctx.fillStyle = "black";
+        ctx.lineWidth = desiredPixelWidth;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        obj.rawPaths.forEach(path => {
+          if (path.points.length < 2) return;
+          ctx.beginPath();
+          
+          // Map coordinates manually to canvas pixel space
+          const startX = (path.points[0].x - rawBounds.minX) * scale;
+          const startY = (path.points[0].y - rawBounds.minY) * scale;
+          ctx.moveTo(startX, startY);
+          
+          for (let i = 1; i < path.points.length; i++) {
+            const px = (path.points[i].x - rawBounds.minX) * scale;
+            const py = (path.points[i].y - rawBounds.minY) * scale;
+            ctx.lineTo(px, py);
+          }
+
+          // Check if path is closed and was originally filled in the SVG
+          const first = path.points[0];
+          const last = path.points[path.points.length - 1];
+          const isClosed = path.points.length >= 3 && Math.hypot(first.x - last.x, first.y - last.y) < 0.05;
+
+          // Safeguard: detect background cards / framing rectangles (>85% size and originally filled) and skip filling them.
+          // Also only fill closed paths that are small (<= 40mm) to prevent larger panel shapes from painting the canvas black.
+          let isBackgroundCard = false;
+          let isSmallShape = true;
+          if (isClosed) {
+            let pMinX = Infinity, pMaxX = -Infinity;
+            let pMinY = Infinity, pMaxY = -Infinity;
+            path.points.forEach(pt => {
+              if (pt.x < pMinX) pMinX = pt.x;
+              if (pt.x > pMaxX) pMaxX = pt.x;
+              if (pt.y < pMinY) pMinY = pt.y;
+              if (pt.y > pMaxY) pMaxY = pt.y;
+            });
+            const pW = pMaxX - pMinX;
+            const pH = pMaxY - pMinY;
+            if (path.originallyFilled) {
+              isBackgroundCard = (pW > 0.85 * rawW) && (pH > 0.85 * rawH);
+              isSmallShape = (pW <= 40.0) && (pH <= 40.0);
+            }
+          }
+
+          if (isClosed && path.originallyFilled && isSmallShape && !isBackgroundCard) {
+            ctx.fill();
+          } else if (!isBackgroundCard) {
+            ctx.stroke();
+          }
+        });
+
+        // Debug filled paths
+        let filledCount = 0;
+        let skippedBgCount = 0;
+        let largeFilledInfo: string[] = [];
+        obj.rawPaths.forEach((path, idx) => {
+          if (path.points.length < 2) return;
+          const first = path.points[0];
+          const last = path.points[path.points.length - 1];
+          const isClosed = path.points.length >= 3 && Math.hypot(first.x - last.x, first.y - last.y) < 0.05;
+          if (isClosed && path.originallyFilled) {
+            let pMinX = Infinity, pMaxX = -Infinity;
+            let pMinY = Infinity, pMaxY = -Infinity;
+            path.points.forEach(pt => {
+              if (pt.x < pMinX) pMinX = pt.x;
+              if (pt.x > pMaxX) pMaxX = pt.x;
+              if (pt.y < pMinY) pMinY = pt.y;
+              if (pt.y > pMaxY) pMaxY = pt.y;
+            });
+            const pW = pMaxX - pMinX;
+            const pH = pMaxY - pMinY;
+            const isBg = (pW > 0.85 * rawW) && (pH > 0.85 * rawH);
+            if (isBg) {
+              skippedBgCount++;
+            } else {
+              filledCount++;
+              if (pW > 20 || pH > 20) {
+                largeFilledInfo.push(`[Path #${idx}] ${pW.toFixed(1)}x${pH.toFixed(1)}mm bounds=[${pMinX.toFixed(1)},${pMaxX.toFixed(1)}]`);
+              }
+            }
+          }
+        });
+
+        // Get image data
+        const imgData = ctx.getImageData(0, 0, canvasW, canvasH);
+        const pixels = imgData.data;
+
+        // Run skeletonization on raw thresholded pixels
+        const grid = skeletonize(canvasW, canvasH, pixels);
+
+        // Trace thinned lines to paths
+        const tracedPixelPaths = traceSkeleton(canvasW, canvasH, grid);
+
+        // Convert pixel paths back to raw millimeter coordinates
+        const monolinePaths: Toolpath[] = tracedPixelPaths.map(pixelPath => {
+          const points = pixelPath.map(pt => {
+            const rawX = rawBounds.minX + (pt.x / canvasW) * rawW;
+            const rawY = rawBounds.minY + (pt.y / canvasH) * rawH;
+            return { x: rawX, y: rawY };
+          });
+          
+          // Apply moving average smoothing to eliminate grid staircase artifacts and recover smooth, supple curves
+          const smoothedPoints = smoothPath(points, 4);
+
+          // Calculate an adaptive RDP simplification tolerance based on the pixel size to smooth out staircases
+          // while preserving fine design features.
+          const pixelSizeMm = rawW / canvasW;
+          const adaptiveTolerance = Math.max(0.03, 0.6 * pixelSizeMm);
+          const simplifiedPoints = simplifyRDP(smoothedPoints, adaptiveTolerance);
+
+          return {
+            points: simplifiedPoints
+          };
+        }).filter(p => p.points.length >= 2);
+
+        if (monolinePaths.length === 0) {
+          throw new Error("Skeletonization resulted in empty paths. Try reducing the Merge Gap Width or ensuring the design is not too thin.");
+        }
+
+        let blackPixels = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+          if (pixels[i] < 240) blackPixels++;
+        }
+        const diag = {
+          originalPathsCount: obj.rawPaths.length,
+          canvasW,
+          canvasH,
+          rawBounds,
+          rawW: parseFloat(rawW.toFixed(3)),
+          rawH: parseFloat(rawH.toFixed(3)),
+          blackPixels,
+          tracedPixelPathsCount: tracedPixelPaths.length,
+          monolinePathsCount: monolinePaths.length,
+          filledCount,
+          skippedBgCount,
+          largeFilledInfo
+        };
+        console.log("ConvertToMonoline Diagnostic:", diag);
+        setConsoleLogs(prev => [...prev, `[MONOLINE DIAG] ${JSON.stringify(diag)}`]);
+
+        setObjects(prev => prev.map(o => {
+          if (o.id === objId) {
+            return {
+              ...o,
+              name: o.name.endsWith(" (Monoline)") ? o.name : `${o.name} (Monoline)`,
+              rawPaths: monolinePaths,
+              isMonoline: true
+            };
+          }
+          return o;
+        }));
+
+        setSlicingStats(null);
+        setRawSlicedPaths([]);
+        setStatusMsg(`Converted "${obj.name}" to monoline (${monolinePaths.length} paths).`);
+      } catch (err: any) {
+        console.error("Monoline conversion failed:", err);
+        setStatusMsg(`Monoline Error: ${err.message || err}`);
+        alert(`Monoline Conversion Failed:\n\n${err.message || err}`);
+      } finally {
+        setLoadingText(null);
+      }
+    }, 50);
   };
 
   const handleAddPenProfile = () => {
@@ -794,11 +1309,13 @@ function App() {
       id: newId,
       name: newPenName,
       capacityMeters: newPenCapacity,
-      accumulatedDistanceMeters: 0
+      accumulatedDistanceMeters: 0,
+      tipSizeMm: newPenTipSize
     };
     setPenProfiles(prev => [...prev, newProfile]);
     setActiveProfileId(newId);
     setNewPenName("");
+    setNewPenTipSize(0.4);
     setStatusMsg(`Added custom pen profile: ${newPenName}`);
   };
 
@@ -824,7 +1341,7 @@ function App() {
       return obj;
     }));
     setSlicingStats(null); // Force re-slice
-    setSlicedPaths([]);
+    setRawSlicedPaths([]);
   };
 
   const getUnrotatedObjectBounds = (obj: SlicerObject) => {
@@ -865,215 +1382,279 @@ function App() {
       return obj;
     }));
     setSlicingStats(null); // Force re-slice
-    setSlicedPaths([]);
+    setRawSlicedPaths([]);
     setStatusMsg(`Flipped selection ${direction === "horizontal" ? "horizontally" : "vertically"}`);
   };
 
-  const handleArrangeAll = () => {
+  const handleWidthChange = (valStr: string) => {
+    setInputWidthText(valStr);
+    const val = parseFloat(valStr);
+    if (!isNaN(val) && val > 0 && selectedObjectId && selectedObjectId !== "template-object") {
+      const selected = objects.find(o => o.id === selectedObjectId);
+      if (selected) {
+        const bounds = getUnrotatedObjectBounds(selected);
+        if (bounds) {
+          const rawW = bounds.maxX - bounds.minX;
+          if (rawW > 0) {
+            const newScaleX = Math.round((val / rawW) * 100);
+            if (newScaleX > 0) {
+              setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scaleX: newScaleX } : o));
+              setRawSlicedPaths([]);
+              setSlicingStats(null);
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const handleHeightChange = (valStr: string) => {
+    setInputHeightText(valStr);
+    const val = parseFloat(valStr);
+    if (!isNaN(val) && val > 0 && selectedObjectId && selectedObjectId !== "template-object") {
+      const selected = objects.find(o => o.id === selectedObjectId);
+      if (selected) {
+        const bounds = getUnrotatedObjectBounds(selected);
+        if (bounds) {
+          const rawH = bounds.maxY - bounds.minY;
+          if (rawH > 0) {
+            const newScaleY = Math.round((val / rawH) * 100);
+            if (newScaleY > 0) {
+              setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scaleY: newScaleY } : o));
+              setRawSlicedPaths([]);
+              setSlicingStats(null);
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const handleArrangeAll = async () => {
     if (activeTab === "preview") return;
     const N = objects.length;
     if (N === 0) return;
 
-    const startX = margin;
-    const startY = margin;
-    const spacing = 15.0; // 15mm comfortable safety spacing between designs for cutting
+    setLoadingText("Auto-Arranging Designs...");
+    // Wait for React to render loading overlay
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const bedCenterX = scaleWidth / 2;
-    const bedCenterY = scaleHeight / 2;
+    try {
+      const startX = margin;
+      const startY = margin;
+      const spacing = 15.0; // 15mm comfortable safety spacing between designs for cutting
 
-    let currentX = startX;
-    let currentY = startY;
-    let maxRowHeight = 0;
+      const bedCenterX = scaleWidth / 2;
+      const bedCenterY = scaleHeight / 2;
 
-    const arranged = objects.map((obj) => {
-      // Get original unscaled bounds
-      let minX = Infinity, maxX = -Infinity;
-      let minY = Infinity, maxY = -Infinity;
-      obj.rawPaths.forEach(path => {
-        path.points.forEach(pt => {
-          if (pt.x < minX) minX = pt.x;
-          if (pt.x > maxX) maxX = pt.x;
-          if (pt.y < minY) minY = pt.y;
-          if (pt.y > maxY) maxY = pt.y;
+      let currentX = startX;
+      let currentY = startY;
+      let maxRowHeight = 0;
+
+      const arranged = objects.map((obj) => {
+        // Get original unscaled bounds
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+        obj.rawPaths.forEach(path => {
+          path.points.forEach(pt => {
+            if (pt.x < minX) minX = pt.x;
+            if (pt.x > maxX) maxX = pt.x;
+            if (pt.y < minY) minY = pt.y;
+            if (pt.y > maxY) maxY = pt.y;
+          });
         });
+
+        if (minX === Infinity) return obj;
+
+        const rawW = maxX - minX;
+        const rawH = maxY - minY;
+
+        let newScaleX = obj.scaleX;
+        let newScaleY = obj.scaleY;
+        let objW = rawW * (newScaleX / 100);
+        let objH = rawH * (newScaleY / 100);
+
+        if (allowArrangeResize) {
+          // If auto-scale is allowed, fit inside a default cell width/height
+          const cols = Math.ceil(Math.sqrt(N));
+          const rows = Math.ceil(N / cols);
+          const cellW = (scaleWidth - margin * 2) / cols;
+          const cellH = (scaleHeight - margin * 2) / rows;
+          const maxFitW = cellW * 0.9;
+          const maxFitH = cellH * 0.9;
+          const scaleRatio = Math.min(maxFitW / rawW, maxFitH / rawH);
+          const fitScale = Math.max(10, Math.min(400, Math.floor(scaleRatio * 100)));
+          newScaleX = fitScale;
+          newScaleY = fitScale;
+          objW = rawW * (newScaleX / 100);
+          objH = rawH * (newScaleY / 100);
+        }
+
+        // Check if it fits on the current row
+        if (currentX + objW > scaleWidth - margin && currentX > startX) {
+          // Wrap to next row
+          currentX = startX;
+          currentY += maxRowHeight + spacing;
+          maxRowHeight = 0;
+        }
+
+        // Check if it exceeds the bed height margin warning
+        if (currentY + objH > scaleHeight - margin) {
+          // Just place it at the last row anyway, or overlap
+        }
+
+        // Target center coordinates of this object cell in bed workspace
+        const cellCenterX = currentX + objW / 2;
+        const cellCenterY = currentY + objH / 2;
+
+        // Update row measurements
+        if (objH > maxRowHeight) {
+          maxRowHeight = objH;
+        }
+
+        // Move cursor forward for next object
+        currentX += objW + spacing;
+
+        // Offset coordinates relative to the bed center
+        const newOffsetX = cellCenterX - bedCenterX;
+        const newOffsetY = cellCenterY - bedCenterY;
+
+        return {
+          ...obj,
+          scaleX: newScaleX,
+          scaleY: newScaleY,
+          offsetX: newOffsetX,
+          offsetY: newOffsetY
+        };
       });
 
-      if (minX === Infinity) return obj;
-
-      const rawW = maxX - minX;
-      const rawH = maxY - minY;
-
-      let newScale = obj.scale;
-      let objW = rawW * (newScale / 100);
-      let objH = rawH * (newScale / 100);
-
-      if (allowArrangeResize) {
-        // If auto-scale is allowed, fit inside a default cell width/height
-        const cols = Math.ceil(Math.sqrt(N));
-        const rows = Math.ceil(N / cols);
-        const cellW = (scaleWidth - margin * 2) / cols;
-        const cellH = (scaleHeight - margin * 2) / rows;
-        const maxFitW = cellW * 0.9;
-        const maxFitH = cellH * 0.9;
-        const scaleRatio = Math.min(maxFitW / rawW, maxFitH / rawH);
-        newScale = Math.max(10, Math.min(400, Math.floor(scaleRatio * 100)));
-        objW = rawW * (newScale / 100);
-        objH = rawH * (newScale / 100);
-      }
-
-      // Check if it fits on the current row
-      if (currentX + objW > scaleWidth - margin && currentX > startX) {
-        // Wrap to next row
-        currentX = startX;
-        currentY += maxRowHeight + spacing;
-        maxRowHeight = 0;
-      }
-
-      // Check if it exceeds the bed height margin warning
-      if (currentY + objH > scaleHeight - margin) {
-        // Just place it at the last row anyway, or overlap
-      }
-
-      // Target center coordinates of this object cell in bed workspace
-      const cellCenterX = currentX + objW / 2;
-      const cellCenterY = currentY + objH / 2;
-
-      // Update row measurements
-      if (objH > maxRowHeight) {
-        maxRowHeight = objH;
-      }
-
-      // Move cursor forward for next object
-      currentX += objW + spacing;
-
-      // Offset coordinates relative to the bed center
-      const newOffsetX = cellCenterX - bedCenterX;
-      const newOffsetY = cellCenterY - bedCenterY;
-
-      return {
-        ...obj,
-        scale: newScale,
-        offsetX: newOffsetX,
-        offsetY: newOffsetY
-      };
-    });
-
-    setObjects(arranged);
-    setSlicingStats(null);
-    setSlicedPaths([]);
-    setStatusMsg(`Arranged ${N} designs compactly near home with ${spacing}mm safety spacing.`);
+      setObjects(arranged);
+      setSlicingStats(null);
+      setRawSlicedPaths([]);
+      setStatusMsg(`Arranged ${N} designs compactly near home with ${spacing}mm safety spacing.`);
+    } finally {
+      setLoadingText(null);
+    }
   };
 
-  const handleSlice = () => {
+  const handleSlice = async () => {
     const combinedPaths = getProcessedToolpaths();
     if (combinedPaths.length === 0) return;
 
-    setStatusMsg("Slicing and optimizing toolpath...");
-    
-    // Separate fills and outlines
-    const fillPaths = combinedPaths.filter(p => p.isFill);
-    const outlinePaths = combinedPaths.filter(p => !p.isFill);
+    setLoadingText("Slicing & Optimizing Toolpaths...");
+    // Wait for React to render loading overlay
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const optimizePathsNN = (paths: Toolpath[], startPoint: Point): { optimized: Toolpath[], endPoint: Point } => {
-      const unvisited = [...paths];
-      const optimized: Toolpath[] = [];
-      let currPos = { ...startPoint };
+    try {
+      setStatusMsg("Slicing and optimizing toolpath...");
+      
+      // Separate fills and outlines
+      const fillPaths = combinedPaths.filter(p => p.isFill);
+      const outlinePaths = combinedPaths.filter(p => !p.isFill);
 
-      while (unvisited.length > 0) {
-        let minSqDist = Infinity;
-        let bestIdx = 0;
-        let shouldReverse = false;
+      const optimizePathsNN = (paths: Toolpath[], startPoint: Point): { optimized: Toolpath[], endPoint: Point } => {
+        const unvisited = [...paths];
+        const optimized: Toolpath[] = [];
+        let currPos = { ...startPoint };
 
-        for (let i = 0; i < unvisited.length; i++) {
-          const path = unvisited[i];
-          if (path.points.length === 0) continue;
-          const startPt = path.points[0];
-          const endPt = path.points[path.points.length - 1];
+        while (unvisited.length > 0) {
+          let minSqDist = Infinity;
+          let bestIdx = 0;
+          let shouldReverse = false;
+
+          for (let i = 0; i < unvisited.length; i++) {
+            const path = unvisited[i];
+            if (path.points.length === 0) continue;
+            const startPt = path.points[0];
+            const endPt = path.points[path.points.length - 1];
+            
+            const dxStart = startPt.x - currPos.x;
+            const dyStart = startPt.y - currPos.y;
+            const dStartSq = dxStart * dxStart + dyStart * dyStart;
+
+            const dxEnd = endPt.x - currPos.x;
+            const dyEnd = endPt.y - currPos.y;
+            const dEndSq = dxEnd * dxEnd + dyEnd * dyEnd;
+
+            if (dStartSq < minSqDist) {
+              minSqDist = dStartSq;
+              bestIdx = i;
+              shouldReverse = false;
+            }
+            if (dEndSq < minSqDist) {
+              minSqDist = dEndSq;
+              bestIdx = i;
+              shouldReverse = true;
+            }
+          }
+
+          const nextPath = unvisited[bestIdx];
+          // Swap with last and pop for O(1) removal
+          unvisited[bestIdx] = unvisited[unvisited.length - 1];
+          unvisited.pop();
+
+          if (shouldReverse) {
+            nextPath.points.reverse();
+          }
           
-          const dxStart = startPt.x - currPos.x;
-          const dyStart = startPt.y - currPos.y;
-          const dStartSq = dxStart * dxStart + dyStart * dyStart;
-
-          const dxEnd = endPt.x - currPos.x;
-          const dyEnd = endPt.y - currPos.y;
-          const dEndSq = dxEnd * dxEnd + dyEnd * dyEnd;
-
-          if (dStartSq < minSqDist) {
-            minSqDist = dStartSq;
-            bestIdx = i;
-            shouldReverse = false;
-          }
-          if (dEndSq < minSqDist) {
-            minSqDist = dEndSq;
-            bestIdx = i;
-            shouldReverse = true;
-          }
+          currPos = nextPath.points[nextPath.points.length - 1];
+          optimized.push(nextPath);
         }
 
-        const nextPath = unvisited[bestIdx];
-        // Swap with last and pop for O(1) removal
-        unvisited[bestIdx] = unvisited[unvisited.length - 1];
-        unvisited.pop();
+        return { optimized, endPoint: currPos };
+      };
 
-        if (shouldReverse) {
-          nextPath.points.reverse();
+      // Optimize fills first, starting from origin (0, 0)
+      const fillsResult = optimizePathsNN(fillPaths, { x: 0, y: 0 });
+
+      // Optimize outlines second, starting from where the fills ended
+      const outlinesResult = optimizePathsNN(outlinePaths, fillsResult.endPoint);
+
+      const optimizedPaths = [...fillsResult.optimized, ...outlinesResult.optimized];
+
+      setRawSlicedPaths(optimizedPaths);
+
+      // Auto-position the priming line relative to new sliced design boundaries
+      const bounds = getCombinedObjectsBounds();
+      if (bounds) {
+        if (primingDirection === "vertical") {
+          let targetX = bounds.minX - 8;
+          if (targetX < margin) {
+            targetX = bounds.maxX + 8;
+            if (targetX > scaleWidth - margin) {
+              targetX = margin;
+            }
+          }
+          let targetY = bounds.minY;
+          if (targetY < margin) targetY = margin;
+          if (targetY + primingLength > scaleHeight - margin) {
+            targetY = Math.max(margin, scaleHeight - margin - primingLength);
+          }
+          setPrimingStartX(parseFloat(targetX.toFixed(1)));
+          setPrimingStartY(parseFloat(targetY.toFixed(1)));
+        } else {
+          let targetY = bounds.maxY + 8;
+          if (targetY > scaleHeight - margin) {
+            targetY = bounds.minY - 8;
+            if (targetY < margin) {
+              targetY = margin;
+            }
+          }
+          let targetX = bounds.minX;
+          if (targetX < margin) targetX = margin;
+          if (targetX + primingLength > scaleWidth - margin) {
+            targetX = Math.max(margin, scaleWidth - margin - primingLength);
+          }
+          setPrimingStartX(parseFloat(targetX.toFixed(1)));
+          setPrimingStartY(parseFloat(targetY.toFixed(1)));
         }
-        
-        currPos = nextPath.points[nextPath.points.length - 1];
-        optimized.push(nextPath);
       }
 
-      return { optimized, endPoint: currPos };
-    };
-
-    // Optimize fills first, starting from origin (0, 0)
-    const fillsResult = optimizePathsNN(fillPaths, { x: 0, y: 0 });
-
-    // Optimize outlines second, starting from where the fills ended
-    const outlinesResult = optimizePathsNN(outlinePaths, fillsResult.endPoint);
-
-    const optimizedPaths = [...fillsResult.optimized, ...outlinesResult.optimized];
-
-    setRawSlicedPaths(optimizedPaths);
-
-    // Auto-position the priming line relative to new sliced design boundaries
-    const bounds = getCombinedObjectsBounds();
-    if (bounds) {
-      if (primingDirection === "vertical") {
-        let targetX = bounds.minX - 8;
-        if (targetX < margin) {
-          targetX = bounds.maxX + 8;
-          if (targetX > scaleWidth - margin) {
-            targetX = margin;
-          }
-        }
-        let targetY = bounds.minY;
-        if (targetY < margin) targetY = margin;
-        if (targetY + primingLength > scaleHeight - margin) {
-          targetY = Math.max(margin, scaleHeight - margin - primingLength);
-        }
-        setPrimingStartX(parseFloat(targetX.toFixed(1)));
-        setPrimingStartY(parseFloat(targetY.toFixed(1)));
-      } else {
-        let targetY = bounds.maxY + 8;
-        if (targetY > scaleHeight - margin) {
-          targetY = bounds.minY - 8;
-          if (targetY < margin) {
-            targetY = margin;
-          }
-        }
-        let targetX = bounds.minX;
-        if (targetX < margin) targetX = margin;
-        if (targetX + primingLength > scaleWidth - margin) {
-          targetX = Math.max(margin, scaleWidth - margin - primingLength);
-        }
-        setPrimingStartX(parseFloat(targetX.toFixed(1)));
-        setPrimingStartY(parseFloat(targetY.toFixed(1)));
-      }
+      setActiveTab("preview");
+      setStatusMsg("Toolpath sliced and optimized successfully!");
+    } finally {
+      setLoadingText(null);
     }
-
-    setActiveTab("preview");
-    setStatusMsg("Toolpath sliced and optimized successfully!");
   };
 
   const handleAutoPositionPriming = () => {
@@ -1270,14 +1851,31 @@ function App() {
     if (selectedObjectId === "template-object") {
       setInputScaleText(templateScale.toString());
       setInputRotationText(templateRotation.toString());
+      setInputWidthText("");
+      setInputHeightText("");
     } else {
       const selected = objects.find(o => o.id === selectedObjectId);
       if (selected) {
-        setInputScaleText(selected.scale.toString());
+        setInputScaleText(selected.scaleX.toString());
         setInputRotationText(selected.rotation.toString());
+        
+        const bounds = getUnrotatedObjectBounds(selected);
+        if (bounds) {
+          const rawW = bounds.maxX - bounds.minX;
+          const rawH = bounds.maxY - bounds.minY;
+          const currentW = rawW * (selected.scaleX / 100);
+          const currentH = rawH * (selected.scaleY / 100);
+          setInputWidthText(currentW.toFixed(1));
+          setInputHeightText(currentH.toFixed(1));
+        } else {
+          setInputWidthText("");
+          setInputHeightText("");
+        }
       } else {
         setInputScaleText("");
         setInputRotationText("");
+        setInputWidthText("");
+        setInputHeightText("");
       }
     }
   }, [selectedObjectId, objects, templateScale, templateRotation]);
@@ -1292,6 +1890,18 @@ function App() {
     return () => {
       window.removeEventListener("dragover", preventDefault);
       window.removeEventListener("drop", preventDefault);
+    };
+  }, []);
+
+  // Global error listener to display console/runtime errors right in the statusMsg
+  useEffect(() => {
+    const handleError = (e: ErrorEvent) => {
+      setStatusMsg(`App Error: ${e.message}`);
+      setConsoleLogs(prev => [...prev, `App Error: ${e.message} at ${e.filename}:${e.lineno}`]);
+    };
+    window.addEventListener("error", handleError);
+    return () => {
+      window.removeEventListener("error", handleError);
     };
   }, []);
 
@@ -1341,8 +1951,8 @@ function App() {
 
   // Autoscroll monitor console
   useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: "smooth" });
+    if (consoleContainerRef.current) {
+      consoleContainerRef.current.scrollTop = consoleContainerRef.current.scrollHeight;
     }
   }, [consoleLogs]);
 
@@ -1415,6 +2025,30 @@ function App() {
     scanPorts();
   }, []);
 
+  // Load recovery session on startup if present
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("axidraw_recovery_session");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.progress && parsed.progress.global_point_index > 0) {
+          setRecoverySession(parsed);
+        }
+      }
+    } catch (e) {
+      console.error("Error reading recovery session:", e);
+    }
+  }, []);
+
+  // Synchronize hatch spacing with active pen profile tip size
+  useEffect(() => {
+    const profile = penProfiles.find(p => p.id === activeProfileId);
+    if (profile && profile.tipSizeMm !== undefined) {
+      setSvgHatchSpacing(profile.tipSizeMm);
+      setLocalHatchSpacing(profile.tipSizeMm);
+    }
+  }, [activeProfileId, penProfiles]);
+
   // Set default inversions based on origin selection
   useEffect(() => {
     if (originCorner === "top-right") {
@@ -1446,12 +2080,13 @@ function App() {
         const ratio = payload.global_point_index / totalPoints;
         
         const drawM = slicingStatsRef.current ? (slicingStatsRef.current.drawDist * ratio) / 1000.0 : 0.0;
+        lastDistanceDrawnRef.current = drawM;
         const travelM = slicingStatsRef.current ? (slicingStatsRef.current.airDist * ratio) / 1000.0 : 0.0;
         const remaining = slicingStatsRef.current ? Math.max(0, Math.round(slicingStatsRef.current.timeEst - elapsed)) : 0;
         const airTravelSecs = slicingStatsRef.current ? slicingStatsRef.current.airTimeEst * ratio : 0.0;
 
-        setJobStats({
-          status: isPausedRef.current ? "paused" : "printing",
+        const updatedStats = {
+          status: (isPausedRef.current ? "paused" : "printing") as any,
           pointsCompleted: payload.global_point_index,
           totalPoints: payload.total_points,
           pathsCompleted: payload.path_index,
@@ -1461,7 +2096,23 @@ function App() {
           elapsedTime: elapsed,
           estimatedRemaining: remaining,
           airTravelTime: Math.round(airTravelSecs)
-        });
+        };
+
+        setJobStats(updatedStats);
+
+        // Save recovery session for real jobs
+        if (jobStartTimeRef.current) {
+          const recoveryData = {
+            objects: objectsRef.current,
+            slicedPaths: slicedPathsRef.current,
+            slicingStats: slicingStatsRef.current,
+            jobStats: updatedStats,
+            progress: payload,
+            activeProfileId: activeProfileIdRef.current,
+            timestamp: Date.now()
+          };
+          localStorage.setItem("axidraw_recovery_session", JSON.stringify(recoveryData));
+        }
       }
     }).then((fn) => {
       if (!active) fn();
@@ -1492,6 +2143,13 @@ function App() {
         };
       });
       
+      const wasRealJob = jobStartTimeRef.current !== null;
+
+      // Clear recovery session state on completion or abort
+      if (wasRealJob) {
+        localStorage.removeItem("axidraw_recovery_session");
+      }
+
       // Calculate elapsed time and open completion screen only if not aborted
       if (!aborted && jobStartTimeRef.current) {
         const elapsed = Math.round((Date.now() - jobStartTimeRef.current) / 1000);
@@ -1500,22 +2158,25 @@ function App() {
       }
       setJobStartTime(null);
 
-      // Add to job history list
-      if (addToJobHistoryRef.current) {
+      // Add to job history list only for real plot jobs
+      if (wasRealJob && addToJobHistoryRef.current) {
         addToJobHistoryRef.current(aborted);
       }
 
-      // Update pen profiles distance tracker upon job completion
-      if (slicingStatsRef.current) {
-        setPenProfiles(prev => prev.map(p => {
-          if (p.id === activeProfileIdRef.current) {
-            return {
-              ...p,
-              accumulatedDistanceMeters: p.accumulatedDistanceMeters + ((slicingStatsRef.current?.drawDist ?? 0) / 1000)
-            };
-          }
-          return p;
-        }));
+      // Update pen profiles distance tracker upon job completion/abort based on actual net drawn distance
+      if (wasRealJob) {
+        const netDrawnMeters = Math.max(0, lastDistanceDrawnRef.current - initialDrawnMetersOfRunRef.current);
+        if (netDrawnMeters > 0) {
+          setPenProfiles(prev => prev.map(p => {
+            if (p.id === activeProfileIdRef.current) {
+              return {
+                ...p,
+                accumulatedDistanceMeters: p.accumulatedDistanceMeters + netDrawnMeters
+              };
+            }
+            return p;
+          }));
+        }
       }
     }).then((fn) => {
       if (!active) fn();
@@ -1525,7 +2186,16 @@ function App() {
     listen<string>("inkscape-import", (event) => {
       const svgText = event.payload;
       try {
-        const parsed = parseSVG(svgText, scaleWidthRef.current, scaleHeightRef.current, svgHatchSpacingRef.current, enableSvgHatchingRef.current);
+        const parsed = parseSVG(
+          svgText, 
+          scaleWidthRef.current, 
+          scaleHeightRef.current, 
+          svgHatchSpacingRef.current, 
+          enableSvgHatchingRef.current,
+          svgHatchStyleRef.current,
+          svgHatchAngleRef.current,
+          svgCrossHatchRef.current
+        );
         setObjects((prev) => {
           const newObj: SlicerObject = {
             id: `obj-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -1533,7 +2203,8 @@ function App() {
             rawPaths: parsed,
             offsetX: 0,
             offsetY: 0,
-            scale: 100,
+            scaleX: 100,
+            scaleY: 100,
             rotation: 0,
             svgText: svgText
           };
@@ -1572,25 +2243,58 @@ function App() {
     enablePrimingLine, primingStartX, primingStartY, primingLength, primingDirection, slicedPaths
   ]);
 
-  // Re-parse SVGs when hatch spacing or enableSvgHatching changes
+  // Re-parse SVGs when hatch spacing, style, angle, cross-hatch, or enableSvgHatching changes
   useEffect(() => {
-    setObjects(prev => prev.map(obj => {
-      if (obj.svgText) {
-        try {
-          const parsed = parseSVG(obj.svgText, scaleWidth, scaleHeight, svgHatchSpacing, enableSvgHatching);
-          return {
-            ...obj,
-            rawPaths: parsed
-          };
-        } catch (err) {
-          console.error("Failed to re-parse SVG:", err);
+    let active = true;
+
+    const recomputeHatching = async () => {
+      setIsCalculatingHatch(true);
+      // Wait for React to render loading overlay
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      if (!active) return;
+
+      try {
+        const updated = objectsRef.current.map(obj => {
+          if (obj.svgText && !obj.isMonoline) {
+            const parsed = parseSVG(
+              obj.svgText, 
+              scaleWidth, 
+              scaleHeight, 
+              svgHatchSpacing, 
+              enableSvgHatching,
+              svgHatchStyle,
+              svgHatchAngle,
+              svgCrossHatch
+            );
+            return {
+              ...obj,
+              rawPaths: parsed
+            };
+          }
+          return obj;
+        });
+
+        if (active) {
+          setObjects(updated);
+          setSlicingStats(null);
+          setRawSlicedPaths([]);
+        }
+      } catch (err) {
+        console.error("Failed to re-parse SVG:", err);
+      } finally {
+        if (active) {
+          setIsCalculatingHatch(false);
         }
       }
-      return obj;
-    }));
-    setSlicingStats(null);
-    setSlicedPaths([]);
-  }, [svgHatchSpacing, enableSvgHatching, scaleWidth, scaleHeight]);
+    };
+
+    recomputeHatching();
+
+    return () => {
+      active = false;
+    };
+  }, [svgHatchSpacing, enableSvgHatching, svgHatchStyle, svgHatchAngle, svgCrossHatch, scaleWidth, scaleHeight]);
 
   // Redirect to Prepare tab if plotter disconnects while in Monitor tab
   useEffect(() => {
@@ -1842,8 +2546,92 @@ function App() {
       ctx.restore();
     }
 
-    // Draw grid marks (every 50mm) inside the bed boundaries
-    ctx.strokeStyle = "rgba(0, 0, 0, 0.04)";
+    // --- DRAW PHYSICAL RULERS (Réglette millimétrée) ---
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.fillStyle = "rgba(255, 255, 255, 0.45)";
+    ctx.font = `${6.5 * dpiScale}px monospace`;
+    ctx.lineWidth = 1 * dpiScale;
+
+    // 1. Horizontal top ruler (at Y = scaledPadding - 2 * dpiScale)
+    const rulerY = scaledPadding - 2 * dpiScale;
+    ctx.beginPath();
+    ctx.moveTo(scaledPadding, rulerY);
+    ctx.lineTo(canvas.width - scaledPadding, rulerY);
+    ctx.stroke();
+
+    // Horizontal ticks and text
+    for (let gx = 0; gx <= scaleWidth; gx += 10) {
+      const x = scaledPadding + gx * scaleX;
+      ctx.beginPath();
+      if (gx % 50 === 0) {
+        // Major tick
+        ctx.moveTo(x, rulerY);
+        ctx.lineTo(x, rulerY - 6 * dpiScale);
+        ctx.stroke();
+        
+        // Text label
+        ctx.textAlign = "center";
+        ctx.fillText(`${gx}`, x, rulerY - 8 * dpiScale);
+      } else {
+        // Minor tick
+        ctx.moveTo(x, rulerY);
+        ctx.lineTo(x, rulerY - 3 * dpiScale);
+        ctx.stroke();
+      }
+    }
+
+    // 2. Vertical left ruler (at X = scaledPadding - 2 * dpiScale)
+    const rulerX = scaledPadding - 2 * dpiScale;
+    ctx.beginPath();
+    ctx.moveTo(rulerX, scaledPadding);
+    ctx.lineTo(rulerX, canvas.height - scaledPadding);
+    ctx.stroke();
+
+    // Vertical ticks and text
+    for (let gy = 0; gy <= scaleHeight; gy += 10) {
+      const y = scaledPadding + gy * scaleY;
+      ctx.beginPath();
+      if (gy % 50 === 0) {
+        // Major tick
+        ctx.moveTo(rulerX, y);
+        ctx.lineTo(rulerX - 6 * dpiScale, y);
+        ctx.stroke();
+        
+        // Text label
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`${gy}`, rulerX - 8 * dpiScale, y);
+      } else {
+        // Minor tick
+        ctx.moveTo(rulerX, y);
+        ctx.lineTo(rulerX - 3 * dpiScale, y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    // Draw grid marks inside the bed boundaries
+    // 10mm grid lines (ultra faint)
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.015)";
+    ctx.lineWidth = 0.5 * dpiScale;
+    for (let gx = 10; gx < scaleWidth; gx += 10) {
+      if (gx % 50 === 0) continue; // Skip major gridlines
+      ctx.beginPath();
+      ctx.moveTo(scaledPadding + gx * scaleX, scaledPadding);
+      ctx.lineTo(scaledPadding + gx * scaleX, canvas.height - scaledPadding);
+      ctx.stroke();
+    }
+    for (let gy = 10; gy < scaleHeight; gy += 10) {
+      if (gy % 50 === 0) continue; // Skip major gridlines
+      ctx.beginPath();
+      ctx.moveTo(scaledPadding, scaledPadding + gy * scaleY);
+      ctx.lineTo(canvas.width - scaledPadding, scaledPadding + gy * scaleY);
+      ctx.stroke();
+    }
+
+    // 50mm grid lines (faint)
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.05)";
     ctx.lineWidth = 1 * dpiScale;
     for (let gx = 50; gx < scaleWidth; gx += 50) {
       ctx.beginPath();
@@ -1944,25 +2732,66 @@ function App() {
         ctx.lineTo(scaledPadding + path.points[i].x * scaleX, scaledPadding + path.points[i].y * scaleY);
       }
 
-      if (progress && pathIdx < progress.path_index) {
-        ctx.strokeStyle = "rgba(99, 102, 241, 0.8)"; // Indigo drawn
-        ctx.lineWidth = 1.5 * 2;
-      } else if (progress && pathIdx === progress.path_index) {
-        ctx.strokeStyle = "rgba(99, 102, 241, 0.8)";
-        ctx.lineWidth = 1.8 * 2;
-        ctx.stroke();
+      if (simulatePenWidth) {
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
         
-        ctx.beginPath();
-        const startIdx = Math.min(progress.point_index, path.points.length - 1);
-        ctx.moveTo(scaledPadding + path.points[startIdx].x * scaleX, scaledPadding + path.points[startIdx].y * scaleY);
-        for (let i = startIdx + 1; i < path.points.length; i++) {
-          ctx.lineTo(scaledPadding + path.points[i].x * scaleX, scaledPadding + path.points[i].y * scaleY);
+        if (progress && pathIdx < progress.path_index) {
+          ctx.strokeStyle = "rgba(99, 102, 241, 0.85)"; // Drawn segments (Indigo)
+          ctx.lineWidth = svgHatchSpacing * scaleX;
+        } else if (progress && pathIdx === progress.path_index) {
+          ctx.strokeStyle = "rgba(99, 102, 241, 0.85)";
+          ctx.lineWidth = svgHatchSpacing * scaleX;
+          ctx.stroke();
+          
+          ctx.beginPath();
+          const startIdx = Math.min(progress.point_index, path.points.length - 1);
+          ctx.moveTo(scaledPadding + path.points[startIdx].x * scaleX, scaledPadding + path.points[startIdx].y * scaleY);
+          for (let i = startIdx + 1; i < path.points.length; i++) {
+            ctx.lineTo(scaledPadding + path.points[i].x * scaleX, scaledPadding + path.points[i].y * scaleY);
+          }
+          ctx.strokeStyle = "rgba(0, 0, 0, 0.3)"; // Remaining/undrawn paths of current segment
+          ctx.lineWidth = svgHatchSpacing * scaleX;
+        } else {
+          const isSelected = path.objectId ? selectedObjectIds.includes(path.objectId) : false;
+          if (isSelected) {
+            ctx.strokeStyle = "rgba(99, 102, 241, 0.95)";
+          } else {
+            ctx.strokeStyle = activeTab === "preview" ? "rgba(99, 102, 241, 0.65)" : "rgba(0, 0, 0, 0.65)";
+          }
+          ctx.lineWidth = svgHatchSpacing * scaleX;
         }
-        ctx.strokeStyle = "rgba(0, 0, 0, 0.15)";
-        ctx.lineWidth = 1.0 * 2;
       } else {
-        ctx.strokeStyle = activeTab === "preview" ? "rgba(99, 102, 241, 0.7)" : "rgba(0, 0, 0, 0.65)";
-        ctx.lineWidth = activeTab === "preview" ? 1.4 * 2 : 1.0 * 2;
+        ctx.lineCap = "butt";
+        ctx.lineJoin = "miter";
+        
+        const isSelected = path.objectId ? selectedObjectIds.includes(path.objectId) : false;
+
+        if (progress && pathIdx < progress.path_index) {
+          ctx.strokeStyle = "rgba(99, 102, 241, 0.8)"; // Indigo drawn
+          ctx.lineWidth = 1.5 * 2;
+        } else if (progress && pathIdx === progress.path_index) {
+          ctx.strokeStyle = "rgba(99, 102, 241, 0.8)";
+          ctx.lineWidth = 1.8 * 2;
+          ctx.stroke();
+          
+          ctx.beginPath();
+          const startIdx = Math.min(progress.point_index, path.points.length - 1);
+          ctx.moveTo(scaledPadding + path.points[startIdx].x * scaleX, scaledPadding + path.points[startIdx].y * scaleY);
+          for (let i = startIdx + 1; i < path.points.length; i++) {
+            ctx.lineTo(scaledPadding + path.points[i].x * scaleX, scaledPadding + path.points[i].y * scaleY);
+          }
+          ctx.strokeStyle = "rgba(0, 0, 0, 0.15)";
+          ctx.lineWidth = 1.0 * 2;
+        } else {
+          if (isSelected) {
+            ctx.strokeStyle = "var(--accent-color)";
+            ctx.lineWidth = 2.0 * dpiScale;
+          } else {
+            ctx.strokeStyle = activeTab === "preview" ? "rgba(99, 102, 241, 0.7)" : "rgba(0, 0, 0, 0.65)";
+            ctx.lineWidth = activeTab === "preview" ? 1.4 * 2 : 1.0 * 2;
+          }
+        }
       }
       ctx.stroke();
     });
@@ -2215,7 +3044,7 @@ function App() {
           if (distToScale <= handleSizeMm * 1.5) {
             setDragMode("scale");
             setIsDragging(true);
-            setDragStart({ x: mmX, y: mmY, initOffsetX: obj.scale, initOffsetY: 0 });
+            setDragStart({ x: mmX, y: mmY, initOffsetX: obj.scaleX, initOffsetY: 0 });
             return;
           }
 
@@ -2433,7 +3262,7 @@ function App() {
           newScale = Math.max(10, Math.min(400, newScale));
           
           // Apply scale change to all selected items together
-          setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scale: newScale } : o));
+          setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scaleX: newScale, scaleY: newScale } : o));
         }
       } else if (dragMode === "rotate") {
         const bedCenterX = scaleWidth / 2;
@@ -2541,6 +3370,132 @@ function App() {
     setDragMode(null);
   };
 
+  const handleDiscardRecovery = () => {
+    localStorage.removeItem("axidraw_recovery_session");
+    setRecoverySession(null);
+    setStatusMsg("Interrupted session discarded");
+  };
+
+  const handleResumeFromRecovery = async () => {
+    if (!recoverySession) return;
+
+    // 1. Restore states
+    setObjects(recoverySession.objects);
+    setSlicedPaths(recoverySession.slicedPaths);
+    setSlicingStats(recoverySession.slicingStats);
+
+    const savedProgress = recoverySession.progress;
+    const finalPaths = recoverySession.slicedPaths;
+
+    // 2. Filter paths to start from savedProgress.global_point_index
+    let remainingPaths: Toolpath[] = [];
+    let currentGlobalIndex = 0;
+    let resumeStartPoint: Point | null = null;
+
+    for (let pathIdx = 0; pathIdx < finalPaths.length; pathIdx++) {
+      const path = finalPaths[pathIdx];
+      const startGlobalOfPath = currentGlobalIndex;
+      const endGlobalOfPath = currentGlobalIndex + path.points.length;
+
+      if (savedProgress.global_point_index >= endGlobalOfPath) {
+        currentGlobalIndex = endGlobalOfPath;
+        continue;
+      }
+
+      if (savedProgress.global_point_index >= startGlobalOfPath && savedProgress.global_point_index < endGlobalOfPath) {
+        const pointOffset = savedProgress.global_point_index - startGlobalOfPath;
+        const remainingPoints = path.points.slice(pointOffset);
+        
+        if (remainingPoints.length > 0) {
+          remainingPaths.push({
+            points: remainingPoints,
+            isFill: path.isFill
+          });
+          resumeStartPoint = remainingPoints[0];
+        }
+        currentGlobalIndex = endGlobalOfPath;
+      } else {
+        remainingPaths.push(path);
+        currentGlobalIndex = endGlobalOfPath;
+      }
+    }
+
+    if (remainingPaths.length === 0) {
+      setStatusMsg("No remaining points to plot!");
+      localStorage.removeItem("axidraw_recovery_session");
+      setRecoverySession(null);
+      return;
+    }
+
+    // 3. Clear recovery state from storage so it doesn't loop
+    localStorage.removeItem("axidraw_recovery_session");
+    setRecoverySession(null);
+
+    // 4. Mirror remaining paths according to settings
+    const mirroredPaths = remainingPaths.map(path => ({
+      points: path.points.map(pt => {
+        let xVal = invertX ? scaleWidth - pt.x : pt.x;
+        let yVal = invertY ? scaleHeight - pt.y : pt.y;
+        return { x: xVal, y: yVal };
+      })
+    }));
+
+    // Apply speed multipliers
+    const activeEbbSpeed = ebbSpeed * (speedMultiplier / 100);
+    const activeAirSpeed = airSpeed * (speedMultiplier / 100);
+
+    try {
+      setStatusMsg("Resuming interrupted plot job...");
+      setIsPlotting(true);
+      setIsPaused(false);
+      
+      setJobStartTime(Date.now() - (recoverySession.jobStats?.elapsedTime || 0) * 1000);
+      initialDrawnMetersOfRunRef.current = recoverySession.jobStats?.distanceDrawn || 0;
+      lastDistanceDrawnRef.current = recoverySession.jobStats?.distanceDrawn || 0;
+      
+      setJobStats({
+        status: "printing",
+        pointsCompleted: savedProgress.global_point_index,
+        totalPoints: savedProgress.total_points,
+        pathsCompleted: savedProgress.path_index,
+        totalPaths: finalPaths.length,
+        distanceDrawn: recoverySession.jobStats?.distanceDrawn || 0,
+        distanceTraveled: recoverySession.jobStats?.distanceTraveled || 0,
+        elapsedTime: recoverySession.jobStats?.elapsedTime || 0,
+        estimatedRemaining: recoverySession.jobStats?.estimatedRemaining || 0,
+        airTravelTime: recoverySession.jobStats?.airTravelTime || 0
+      });
+
+      setActiveTab("monitor");
+
+      // Jog pen to the first point of the resumed job
+      if (resumeStartPoint && connected) {
+        const firstPtX = invertX ? scaleWidth - resumeStartPoint.x : resumeStartPoint.x;
+        const firstPtY = invertY ? scaleHeight - resumeStartPoint.y : resumeStartPoint.y;
+        
+        await invoke("jog_plotter", {
+          dx: firstPtX,
+          dy: firstPtY,
+          speed: activeAirSpeed,
+          bedWidth: scaleWidth,
+          bedHeight: scaleHeight
+        });
+      }
+
+      await invoke("start_plot", {
+        paths: mirroredPaths,
+        speed: activeEbbSpeed,
+        airSpeed: activeAirSpeed,
+        penUpDuration: penDelay,
+        penDownDuration: penDelay,
+      });
+    } catch (err: any) {
+      setStatusMsg(`Resume failed: ${err}`);
+      setIsPlotting(false);
+      setJobStartTime(null);
+    }
+  };
+
   // Plotting queue commands
   const handleStartPlot = async () => {
     if (!connected) {
@@ -2572,6 +3527,8 @@ function App() {
       setIsPlotting(true);
       setIsPaused(false);
       setJobStartTime(Date.now());
+      initialDrawnMetersOfRunRef.current = 0;
+      lastDistanceDrawnRef.current = 0;
       setJobStats({
         status: "printing",
         pointsCompleted: 0,
@@ -2802,6 +3759,8 @@ function App() {
       setIsPlotting(true);
       setIsPaused(false);
       setJobStartTime(Date.now());
+      initialDrawnMetersOfRunRef.current = 0;
+      lastDistanceDrawnRef.current = 0;
       setJobStats({
         status: "printing",
         pointsCompleted: 0,
@@ -2996,8 +3955,48 @@ function App() {
   const totalCanvasWidth = canvasWidth + CANVAS_PADDING * 2;
   const totalCanvasHeight = canvasHeight + CANVAS_PADDING * 2;
 
+  const showBlockingLoader = isCalculatingHatch || isGenerating || loadingText !== null;
+  const currentLoadingText = loadingText || (isGenerating ? "Vectorizing Image..." : (isCalculatingHatch ? "Calculating SVG Fill & Hatching..." : "Processing..."));
+
   return (
     <div className="app-container">
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+      `}</style>
+
+      {showBlockingLoader && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: "rgba(0, 0, 0, 0.75)",
+          backdropFilter: "blur(5px)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 9999,
+          color: "#ffffff"
+        }}>
+          <div style={{
+            width: "50px",
+            height: "50px",
+            border: "4px solid rgba(255, 255, 255, 0.1)",
+            borderTop: "4px solid var(--accent-color, #4361ee)",
+            borderRadius: "50%",
+            animation: "spin 1s linear infinite",
+            marginBottom: "15px"
+          }} />
+          <div style={{ fontSize: "1.1rem", fontWeight: "bold" }}>{currentLoadingText}</div>
+          <div style={{ fontSize: "0.8rem", color: "rgba(255, 255, 255, 0.6)", marginTop: "6px" }}>Please wait...</div>
+        </div>
+      )}
+
       <header className="app-header">
         <div className="brand-section">
           <img src="/logo.png" className="brand-logo" alt="logo" style={{ borderRadius: "4px", objectFit: "contain" }} />
@@ -3099,7 +4098,7 @@ function App() {
                               setObjects(prev => prev.filter(o => o.id !== obj.id));
                               setSelectedObjectIds(prev => prev.filter(id => id !== obj.id));
                               setSlicingStats(null);
-                              setSlicedPaths([]);
+                              setRawSlicedPaths([]);
                             }}
                           >
                             &times;
@@ -3115,6 +4114,35 @@ function App() {
                         Deselect all
                       </button>
                     </div>
+                    {selectedObject && selectedObject.id !== "template-object" && (
+                      <div style={{ marginTop: "12px", padding: "10px", backgroundColor: "var(--bg-tertiary)", borderRadius: "6px", border: "1px solid var(--border-color)", display: "flex", flexDirection: "column", gap: "8px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontWeight: "bold" }}>Monoline Merge Gap</span>
+                          <span style={{ fontSize: "0.75rem", color: "var(--accent-color)", fontWeight: "bold" }}>{monolineMergeWidth.toFixed(2)} mm</span>
+                        </div>
+                        <input 
+                          type="range" 
+                          min="0.0" 
+                          max="3.0" 
+                          step="0.05" 
+                          value={monolineMergeWidth} 
+                          onChange={(e) => setMonolineMergeWidth(parseFloat(e.target.value))} 
+                          style={{ width: "100%", margin: 0, padding: 0 }}
+                          title="Gaps wider than this size won't be merged into single strokes"
+                        />
+                        <span style={{ fontSize: "0.62rem", color: "var(--text-muted)", lineHeight: "1.2" }}>
+                          Adjust to merge parallel outlines (expanded strokes) into a single path. Set to 0 to keep all lines thin and separate.
+                        </span>
+                        <button 
+                          className="btn btn-secondary" 
+                          onClick={() => handleConvertToMonoline(selectedObject.id)}
+                          style={{ width: "100%", border: "1px solid var(--accent-color)", padding: "6px", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px", marginTop: "2px" }}
+                          title="Convert this vector object into single centerline paths"
+                        >
+                          ⚡ Convert to Monoline
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -3133,22 +4161,102 @@ function App() {
                   </label>
 
                   {enableSvgHatching && (
-                    <div className="slider-group" style={{ borderTop: "1px solid var(--border-color)", paddingTop: "10px" }}>
-                      <div className="slider-header">
-                        <label>Pen Thickness / Hatch Spacing (mm)</label>
-                        <span className="slider-val">{svgHatchSpacing.toFixed(1)} mm</span>
+                    <div style={{ borderTop: "1px solid var(--border-color)", paddingTop: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
+                      <div className="form-group">
+                        <label>Fill Style</label>
+                        <select value={svgHatchStyle} onChange={(e) => setSvgHatchStyle(e.target.value as "hatch" | "concentric")}>
+                          <option value="hatch">Hatch (Lines)</option>
+                          <option value="concentric">Concentric (Offset)</option>
+                        </select>
                       </div>
-                      <input 
-                        type="range" 
-                        min="0.2" 
-                        max="5.0" 
-                        step="0.1" 
-                        value={svgHatchSpacing} 
-                        onChange={(e) => setSvgHatchSpacing(parseFloat(e.target.value))} 
-                      />
-                      <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", display: "block", marginTop: "2px" }}>
-                        Set to your physical pen thickness (e.g. 0.4mm) for a solid fill, or higher for lines.
-                      </span>
+
+                      <div className="form-group" style={{ marginBottom: "12px" }}>
+                        <label>Pen Thickness / Spacing</label>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "4px" }}>
+                          <select 
+                            value={[0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 1.0].includes(svgHatchSpacing) ? svgHatchSpacing.toString() : "custom"} 
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (val !== "custom") {
+                                const numVal = parseFloat(val);
+                                setSvgHatchSpacing(numVal);
+                                setLocalHatchSpacing(numVal);
+                              }
+                            }}
+                            style={{ flex: 1, minWidth: "0", fontSize: "0.8rem", padding: "5px", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                          >
+                            <option value="0.2">0.20 mm</option>
+                            <option value="0.25">0.25 mm</option>
+                            <option value="0.3">0.30 mm</option>
+                            <option value="0.35">0.35 mm</option>
+                            <option value="0.4">0.40 mm (Default)</option>
+                            <option value="0.45">0.45 mm</option>
+                            <option value="0.5">0.50 mm</option>
+                            <option value="0.6">0.60 mm</option>
+                            <option value="0.7">0.70 mm</option>
+                            <option value="0.8">0.80 mm</option>
+                            <option value="1.0">1.00 mm</option>
+                            <option value="custom">Custom...</option>
+                          </select>
+                          <input 
+                            type="number" 
+                            step="0.01"
+                            min="0.05"
+                            max="10"
+                            value={localHatchSpacing} 
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0.4;
+                              setLocalHatchSpacing(val);
+                            }}
+                            onBlur={() => setSvgHatchSpacing(localHatchSpacing)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                setSvgHatchSpacing(localHatchSpacing);
+                              }
+                            }}
+                            style={{ width: "70px", fontSize: "0.8rem", padding: "5px", textAlign: "right", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                          />
+                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>mm</span>
+                        </div>
+                        <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", display: "block", marginTop: "4px" }}>
+                          Choose a preset or enter the exact pen tip size textually.
+                        </span>
+                      </div>
+
+                      {svgHatchStyle === "hatch" && (
+                        <>
+                          <div className="slider-group">
+                            <div className="slider-header">
+                              <label>Hatch Angle (degrees)</label>
+                              <span className="slider-val">{localHatchAngle}°</span>
+                            </div>
+                            <input 
+                              type="range" 
+                              min="0" 
+                              max="180" 
+                              step="5" 
+                              value={localHatchAngle} 
+                              onChange={(e) => setLocalHatchAngle(parseInt(e.target.value) || 0)}
+                              onMouseUp={() => setSvgHatchAngle(localHatchAngle)}
+                              onTouchEnd={() => setSvgHatchAngle(localHatchAngle)}
+                              onKeyUp={(e) => {
+                                if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown") {
+                                  setSvgHatchAngle(localHatchAngle);
+                                }
+                              }}
+                            />
+                          </div>
+
+                          <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem", cursor: "pointer", userSelect: "none" }}>
+                            <input 
+                              type="checkbox" 
+                              checked={svgCrossHatch} 
+                              onChange={(e) => setSvgCrossHatch(e.target.checked)} 
+                            />
+                            Cross-Hatch (Double density grid)
+                          </label>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -3202,7 +4310,7 @@ function App() {
                     {isGenerating ? "Processing..." : "Generate toolpath"}
                   </button>
 
-                  {selectedObject && selectedObject.name.startsWith("Vectorizer:") && selectedObject.scale !== 100 && (
+                  {selectedObject && selectedObject.name.startsWith("Vectorizer:") && selectedObject.scaleX !== 100 && (
                     <button 
                       className="btn btn-secondary" 
                       onClick={handleOptimizeVectorizerScale} 
@@ -3210,7 +4318,7 @@ function App() {
                       style={{ marginTop: "10px", width: "100%", border: "1px solid var(--accent-color)" }}
                       title="Regenerate vector paths at current scale to optimize path density"
                     >
-                      Optimize Density to Scale ({Math.round(selectedObject.scale)}%)
+                      Optimize Density to Scale ({Math.round(selectedObject.scaleX)}%)
                     </button>
                   )}
                 </div>
@@ -3389,12 +4497,56 @@ function App() {
                   <div className="form-group" style={{ marginBottom: "8px" }}>
                     <input type="text" placeholder="Pen name (e.g. Gelly Roll)" value={newPenName} onChange={(e) => setNewPenName(e.target.value)} style={{ fontSize: "0.8rem" }} />
                   </div>
-                  <div className="form-row" style={{ alignItems: "center" }}>
-                    <div className="form-group" style={{ margin: 0 }}>
-                      <input type="number" placeholder="Cap. (m)" value={newPenCapacity} onChange={(e) => setNewPenCapacity(parseInt(e.target.value) || 1000)} style={{ fontSize: "0.8rem", width: "80px" }} />
+                  <div className="form-row" style={{ alignItems: "center", gap: "6px" }}>
+                    <div className="form-group" style={{ margin: 0, flex: 1.2 }}>
+                      <input 
+                        type="number" 
+                        placeholder="Cap. (m)" 
+                        value={newPenCapacity} 
+                        onChange={(e) => setNewPenCapacity(parseInt(e.target.value) || 1000)} 
+                        style={{ fontSize: "0.8rem", width: "100%", boxSizing: "border-box" }} 
+                        title="Pen ink capacity in meters"
+                      />
                     </div>
-                    <button className="btn btn-secondary" onClick={handleAddPenProfile} style={{ flex: 1, padding: "5px 10px", fontSize: "0.8rem" }}>
-                      Add pen
+                    <div className="form-group" style={{ margin: 0, flex: 2 }}>
+                      <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+                        <select 
+                          value={[0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 1.0].includes(newPenTipSize) ? newPenTipSize.toString() : "custom"} 
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            if (val !== "custom") {
+                              setNewPenTipSize(parseFloat(val));
+                            }
+                          }}
+                          style={{ flex: 1, fontSize: "0.75rem", padding: "4px", minWidth: "0", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                        >
+                          <option value="0.2">0.20</option>
+                          <option value="0.25">0.25</option>
+                          <option value="0.3">0.30</option>
+                          <option value="0.35">0.35</option>
+                          <option value="0.4">0.40</option>
+                          <option value="0.45">0.45</option>
+                          <option value="0.5">0.50</option>
+                          <option value="0.6">0.60</option>
+                          <option value="0.7">0.70</option>
+                          <option value="0.8">0.80</option>
+                          <option value="1.0">1.00</option>
+                          <option value="custom">Cust.</option>
+                        </select>
+                        <input 
+                          type="number" 
+                          step="0.01"
+                          min="0.05"
+                          placeholder="Tip" 
+                          value={newPenTipSize} 
+                          onChange={(e) => setNewPenTipSize(parseFloat(e.target.value) || 0.4)} 
+                          style={{ fontSize: "0.75rem", width: "48px", boxSizing: "border-box", padding: "4px", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)", textAlign: "right" }} 
+                          title="Pen tip size in millimeters"
+                        />
+                      </div>
+                    </div>
+                    <button className="btn btn-secondary" onClick={handleAddPenProfile} style={{ padding: "5px 8px", fontSize: "0.8rem", width: "auto", flexShrink: 0 }}>
+                      Add
                     </button>
                   </div>
                 </div>
@@ -3463,7 +4615,21 @@ function App() {
                   </div>
                 )}
 
-                <button className="btn btn-secondary" onClick={() => setActiveTab("prepare")} style={{ marginTop: "10px", width: "100%" }}>
+                <div style={{ marginTop: "15px", borderTop: "1px solid var(--border-color)", paddingTop: "15px" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "0.82rem", fontWeight: "bold" }}>
+                    <input 
+                      type="checkbox" 
+                      checked={simulatePenWidth} 
+                      onChange={(e) => setSimulatePenWidth(e.target.checked)} 
+                    />
+                    Simulate Pen Width (WYSIWYG)
+                  </label>
+                  <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", display: "block", marginTop: "4px", paddingLeft: "20px" }}>
+                    Render paths matching the physical thickness of your selected pen to preview detail readability.
+                  </span>
+                </div>
+
+                <button className="btn btn-secondary" onClick={() => setActiveTab("prepare")} style={{ marginTop: "15px", width: "100%" }}>
                   Modify parameters
                 </button>
               </div>
@@ -3756,6 +4922,60 @@ function App() {
               }}
               style={{ display: "flex", flexDirection: "column", gap: "15px", overflow: "auto", alignItems: "center", width: "100%", height: "100%", padding: "20px 10px", boxSizing: "border-box" }}
             >
+              {recoverySession && (
+                <div 
+                  style={{
+                    backgroundColor: "rgba(245, 158, 11, 0.08)",
+                    border: "1px solid rgba(245, 158, 11, 0.3)",
+                    borderRadius: "8px",
+                    padding: "14px 20px",
+                    width: "100%",
+                    maxWidth: `${totalCanvasWidth * zoom}px`,
+                    boxSizing: "border-box",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "10px",
+                    backdropFilter: "blur(5px)",
+                    flexShrink: 0
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <span style={{ fontSize: "1.2rem" }}>⚠️</span>
+                    <div style={{ flex: 1 }}>
+                      <h4 style={{ margin: 0, fontSize: "0.85rem", color: "var(--warning)", fontWeight: "600" }}>
+                        Interrupted Plotting Session Detected
+                      </h4>
+                      <p style={{ margin: "4px 0 0 0", fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+                        A previous job for <strong>{recoverySession.objects.map((o: any) => o.name).join(", ")}</strong> was interrupted at point <strong>{recoverySession.progress?.global_point_index}</strong> of <strong>{recoverySession.progress?.total_points}</strong> ({Math.round(((recoverySession.progress?.global_point_index || 0) / (recoverySession.progress?.total_points || 1)) * 100)}%).
+                      </p>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
+                    <button 
+                      className="btn btn-success" 
+                      onClick={handleResumeFromRecovery}
+                      disabled={!connected}
+                      style={{ fontSize: "0.75rem", padding: "6px 12px", width: "auto" }}
+                      title={!connected ? "Connect AxiDraw first to resume job" : ""}
+                    >
+                      Resume Job from Interruption
+                    </button>
+                    <button 
+                      className="btn btn-danger" 
+                      onClick={handleDiscardRecovery}
+                      style={{ fontSize: "0.75rem", padding: "6px 12px", width: "auto", backgroundColor: "rgba(239, 68, 68, 0.15)", color: "var(--danger)", border: "1px solid rgba(239, 68, 68, 0.3)" }}
+                    >
+                      Discard Session
+                    </button>
+                    {!connected && (
+                      <span style={{ fontSize: "0.7rem", color: "var(--warning)", alignSelf: "center" }}>
+                        (Please connect AxiDraw to enable resume)
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Horizontal Slicing Toolbar - aligned at bed level, matching bed width */}
               <div 
                 style={{ 
@@ -3796,7 +5016,7 @@ function App() {
                         setObjects(prev => prev.filter(o => !selectedObjectIds.includes(o.id)));
                         setSelectedObjectIds([]);
                         setSlicingStats(null);
-                        setSlicedPaths([]);
+                        setRawSlicedPaths([]);
                       }
                     }} 
                     disabled={activeTab === "preview" || selectedObjectIds.length === 0} 
@@ -3839,9 +5059,9 @@ function App() {
                           if (selectedObjectId === "template-object") {
                             setTemplateScale(val);
                           } else {
-                            setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scale: val } : o));
+                            setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, scaleX: val, scaleY: val } : o));
                             setSlicingStats(null);
-                            setSlicedPaths([]);
+                            setRawSlicedPaths([]);
                           }
                         }
                       }}
@@ -3849,6 +5069,32 @@ function App() {
                     />
                     <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>%</span>
                   </div>
+
+                  {selectedObject && selectedObjectId !== "template-object" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "nowrap" }}>
+                      <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Size:</span>
+                      <input 
+                        type="number" 
+                        value={inputWidthText} 
+                        disabled={activeTab === "preview"}
+                        onChange={(e) => handleWidthChange(e.target.value)}
+                        style={{ width: "50px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                        placeholder="W"
+                        title="Width in mm"
+                      />
+                      <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>×</span>
+                      <input 
+                        type="number" 
+                        value={inputHeightText} 
+                        disabled={activeTab === "preview"}
+                        onChange={(e) => handleHeightChange(e.target.value)}
+                        style={{ width: "50px", padding: "4px 6px", fontSize: "0.75rem", backgroundColor: "var(--bg-primary)", border: "1px solid var(--border-color)", borderRadius: "4px", color: "var(--text-primary)" }}
+                        placeholder="H"
+                        title="Height in mm"
+                      />
+                      <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginRight: "6px" }}>mm</span>
+                    </div>
+                  )}
 
                   <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "nowrap" }}>
                     <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>Rot/Flip:</span>
@@ -3870,7 +5116,7 @@ function App() {
                           } else {
                             setObjects(prev => prev.map(o => selectedObjectIds.includes(o.id) ? { ...o, rotation: val } : o));
                             setSlicingStats(null);
-                            setSlicedPaths([]);
+                            setRawSlicedPaths([]);
                           }
                         }
                       }}
@@ -3954,7 +5200,59 @@ function App() {
         ) : (
           /* MONITOR TAB CENTER VIEWPORT: Dedicated Fluidd Dashboard */
           <main style={{ flex: 1, minWidth: 0, padding: "20px", display: "flex", flexDirection: "column", gap: "20px", overflowY: "auto" }}>
-            
+            {recoverySession && (
+              <div 
+                style={{
+                  backgroundColor: "rgba(245, 158, 11, 0.08)",
+                  border: "1px solid rgba(245, 158, 11, 0.3)",
+                  borderRadius: "8px",
+                  padding: "14px 20px",
+                  width: "100%",
+                  boxSizing: "border-box",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "10px",
+                  backdropFilter: "blur(5px)",
+                  flexShrink: 0
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span style={{ fontSize: "1.2rem" }}>⚠️</span>
+                  <div style={{ flex: 1 }}>
+                    <h4 style={{ margin: 0, fontSize: "0.85rem", color: "var(--warning)", fontWeight: "600" }}>
+                      Interrupted Plotting Session Detected
+                    </h4>
+                    <p style={{ margin: "4px 0 0 0", fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+                      A previous job for <strong>{recoverySession.objects.map((o: any) => o.name).join(", ")}</strong> was interrupted at point <strong>{recoverySession.progress?.global_point_index}</strong> of <strong>{recoverySession.progress?.total_points}</strong> ({Math.round(((recoverySession.progress?.global_point_index || 0) / (recoverySession.progress?.total_points || 1)) * 100)}%).
+                    </p>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
+                  <button 
+                    className="btn btn-success" 
+                    onClick={handleResumeFromRecovery}
+                    disabled={!connected}
+                    style={{ fontSize: "0.75rem", padding: "6px 12px", width: "auto" }}
+                    title={!connected ? "Connect AxiDraw first to resume job" : ""}
+                  >
+                    Resume Job from Interruption
+                  </button>
+                  <button 
+                    className="btn btn-danger" 
+                    onClick={handleDiscardRecovery}
+                    style={{ fontSize: "0.75rem", padding: "6px 12px", width: "auto", backgroundColor: "rgba(239, 68, 68, 0.15)", color: "var(--danger)", border: "1px solid rgba(239, 68, 68, 0.3)" }}
+                  >
+                    Discard Session
+                  </button>
+                  {!connected && (
+                    <span style={{ fontSize: "0.7rem", color: "var(--warning)", alignSelf: "center" }}>
+                      (Please connect AxiDraw to enable resume)
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Top part: Two Columns side-by-side */}
             <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: "20px", alignItems: "stretch", width: "100%" }}>
               
@@ -3974,7 +5272,7 @@ function App() {
                     </button>
                   </h3>
                   
-                  <div className="monitor-console-container" style={{ flex: 1, minHeight: 0 }}>
+                  <div ref={consoleContainerRef} className="monitor-console-container" style={{ flex: 1, minHeight: 0 }}>
                     {consoleLogs.map((log, idx) => {
                       let className = "console-log-row info";
                       if (log.startsWith("Sent:")) className = "console-log-row sent";
@@ -4002,7 +5300,6 @@ function App() {
                         Terminal listening... Send commands or start job to see EBB serial transactions.
                       </div>
                     )}
-                    <div ref={consoleEndRef} />
                   </div>
 
                   {/* EBB command manual input entry form */}
@@ -4446,6 +5743,52 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* LOADING OVERLAY */}
+      {loadingText && (
+        <div 
+          style={{ 
+            position: "fixed", 
+            top: 0, 
+            left: 0, 
+            width: "100vw", 
+            height: "100vh", 
+            backgroundColor: "rgba(12, 15, 18, 0.75)", 
+            backdropFilter: "blur(4px)",
+            display: "flex", 
+            flexDirection: "column",
+            alignItems: "center", 
+            justifyContent: "center", 
+            zIndex: 2000,
+            gap: "15px"
+          }}
+        >
+          {/* Spinning Loader */}
+          <div style={{
+            width: "45px",
+            height: "45px",
+            border: "3px solid var(--border-color)",
+            borderTop: "3px solid var(--accent-color)",
+            borderRadius: "50%",
+            animation: "spin 1s linear infinite"
+          }} />
+          <div style={{ 
+            color: "var(--text-primary)", 
+            fontSize: "0.95rem", 
+            fontWeight: "500",
+            letterSpacing: "0.5px"
+          }}>
+            {loadingText}
+          </div>
+          
+          <style>{`
+            @keyframes spin {
+              0% { transform: rotate(0deg); }
+              100% { transform: rotate(360deg); }
+            }
+          `}</style>
         </div>
       )}
     </div>
